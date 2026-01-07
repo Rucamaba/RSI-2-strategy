@@ -36,7 +36,7 @@ def check_rsi2_signal(ticker_symbol):
 
     # 4. Define Strategy Logic
     is_uptrend = current_price > sma200
-    is_oversold = rsi2 <= 10
+    is_oversold = rsi2 < 10
     is_exit_zone = current_price > sma5
 
     # 5. Display Results
