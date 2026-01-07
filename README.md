@@ -21,6 +21,16 @@ This project implements a mean-reversion trading strategy popularized by **Larry
 
 The RSI(2) strategy exploits the "rubber band effect." When a strong stock drops sharply in the short term (RSI < 10), it often snaps back to its mean. By exiting at the 5-day SMA, the strategy captures the meat of that snap-back move without overstaying the welcome.
 
+## Installation
+
+```text
+pip install yfinance pandas_ta pandas
+```
+
+```text
+pip install pykrx
+```
+
 ## Example Output
 
 When you run the script, it will display the technical indicators and the trading signal as follows:
