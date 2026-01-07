@@ -28,7 +28,7 @@ pip install yfinance pandas_ta pandas
 ```
 
 ```text
-pip install pykrx
+pip install finance-datareader
 ```
 
 ## Example Output
