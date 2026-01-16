@@ -91,14 +91,14 @@ All simulations were executed with the following standardized parameters to ensu
 
 ##### Method winner
 
-2018: RSI (BEARISH) 
-2019: RSI_DESC
-2020: RSI (BANKRUPTCY) 
-2021: RSI
-2022: RSI (BEARISH) 
-2023: RSI_DESC
-2024: RSI
-2025: RSI
+| 2018 | RSI (BEARISH) |
+| 2019 | RSI_DESC |
+| 2020 | RSI (BANKRUPTCY) |
+| 2021 | RSI |
+| 2022 | RSI (BEARISH) | 
+| 2023 | RSI_DESC |
+| 2024 | RSI |
+| 2025 | RSI |
 
 ---
 
