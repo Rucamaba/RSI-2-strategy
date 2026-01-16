@@ -19,11 +19,14 @@ import time
 LEVERAGE_FACTOR = 5
 INITIAL_CAPITAL = 250.0
 MAX_CONCURRENT_POSITIONS = 5
-START_DATE = "2018-01-01"
-END_DATE = "2018-12-31"
+START_DATE = "2025-01-01"
+END_DATE = "2025-12-31"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
-PRIORITIZATION_METHOD = ['RSI', 'RSI_DESC'] # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
+PRIORITIZATION_METHOD = 'RSI' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
 ALL_METHODS = ['RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC']
+# ==============================================================================
+# ==============================================================================
+STRATEGY_TYPE = "BOTH" # Options: "NORMAL", "INVERSE", "BOTH"
 # ==============================================================================
 # ==============================================================================
 
@@ -77,8 +80,13 @@ def prepare_data(tickers):
                     df['adx_14'] = np.nan
             else:
                 df['adx_14'] = np.nan
-            df["is_buy_signal"] = (df["close"] > df["sma_200"]) & (df["rsi_2"] < 5) & (df["close"] < df["sma_5"])
-            df["is_exit_signal"] = df["close"] > df["sma_5"]
+            # Normal Strategy Signals
+            df["is_buy_signal_normal"] = (df["close"] > df["sma_200"]) & (df["rsi_2"] < 5) & (df["close"] < df["sma_5"])
+            df["is_exit_signal_normal"] = df["close"] > df["sma_5"]
+            
+            # Inverse Strategy Signals
+            df["is_buy_signal_inverse"] = (df["close"] < df["sma_200"]) & (df["rsi_2"] > 95) & (df["close"] > df["sma_5"])
+            df["is_exit_signal_inverse"] = df["close"] < df["sma_5"]
         except Exception as e:
             print(f"Warning: Could not calculate indicators for {ticker}. It will be removed. Error: {e}")
             tickers_to_remove.append(ticker)
@@ -87,7 +95,7 @@ def prepare_data(tickers):
         del all_historical_data[ticker]
     return all_historical_data, master_index
 
-def run_simulation(all_historical_data, master_index, prioritization_method, verbose=True):
+def run_simulation(all_historical_data, master_index, prioritization_method, strategy_type, verbose=True):
     cash = INITIAL_CAPITAL
     portfolio_value_history, positions, completed_trades = [], {}, []
     
@@ -108,7 +116,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, ver
             for ticker in list(positions.keys()):
                 pos_info = positions[ticker]
                 signal_data = all_historical_data[ticker].loc[date]
-                pnl = (signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"]
+                pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
@@ -121,9 +129,10 @@ def run_simulation(all_historical_data, master_index, prioritization_method, ver
 
         for ticker in list(positions.keys()):
             signal_data = all_historical_data[ticker].loc[date]
-            if signal_data["is_exit_signal"]:
+            exit_signal = f"is_exit_signal_{strategy_type.lower()}"
+            if signal_data[exit_signal]:
                 pos_info = positions[ticker]
-                pnl = (signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"]
+                pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
@@ -136,7 +145,8 @@ def run_simulation(all_historical_data, master_index, prioritization_method, ver
             for ticker in all_historical_data.keys():
                 if ticker not in positions:
                     signal_data = all_historical_data[ticker].loc[date]
-                    if signal_data["is_buy_signal"] and not pd.isna(signal_data["close"]):
+                    buy_signal = f"is_buy_signal_{strategy_type.lower()}"
+                    if signal_data[buy_signal] and not pd.isna(signal_data["close"]):
                         potential_buys.append({
                             "ticker": ticker,
                             "rsi": signal_data["rsi_2"],
@@ -282,29 +292,63 @@ if __name__ == '__main__':
     
     if isinstance(PRIORITIZATION_METHOD, list) or PRIORITIZATION_METHOD == 'ALL':
         methods_to_run = PRIORITIZATION_METHOD if isinstance(PRIORITIZATION_METHOD, list) else ALL_METHODS
-        all_results = []
-        for method in methods_to_run:
-            print(f"\n--- Running Simulation for Prioritization Method: {method} ---")
-            results = run_simulation(all_historical_data, master_index, method, verbose=False)
-            performance = calculate_summary_performance(results["portfolio_df"], results["completed_trades"])
-            if performance:
-                performance["Method"] = method
-                all_results.append(performance)
-            
-        print("\n\n--- Overall Performance Summary ---")
-        if all_results:
-            summary_df = pd.DataFrame(all_results).set_index("Method")
-            summary_df['Total Return (sort)'] = summary_df['Total Return'].str.replace('%', '').astype(float)
-            summary_df = summary_df.sort_values(by='Total Return (sort)', ascending=False).drop(columns=['Total Return (sort)'])
-            print(summary_df)
-            print("\nNote: Avg Duration omits Saturdays and Sundays because the markets are closed.")
+        
+        if STRATEGY_TYPE == 'BOTH':
+            strategies = ['NORMAL', 'INVERSE']
         else:
-            print("No results to display.")
+            strategies = [STRATEGY_TYPE]
+
+        for strategy in strategies:
+            print(f"\n--- Running Simulations for {strategy} Strategy ---")
+            all_results = []
+            for method in methods_to_run:
+                print(f"--- Prioritization Method: {method} ---")
+                results = run_simulation(all_historical_data, master_index, method, strategy, verbose=False)
+                performance = calculate_summary_performance(results["portfolio_df"], results["completed_trades"])
+                if performance:
+                    performance["Method"] = method
+                    all_results.append(performance)
+            
+            print(f"\n\n--- Overall Performance Summary for {strategy} Strategy ---")
+            if all_results:
+                summary_df = pd.DataFrame(all_results).set_index("Method")
+                summary_df['Total Return (sort)'] = summary_df['Total Return'].str.replace('%', '').astype(float)
+                summary_df = summary_df.sort_values(by='Total Return (sort)', ascending=False).drop(columns=['Total Return (sort)'])
+                print(summary_df)
+                print("\nNote: Avg Duration omits Saturdays and Sundays because the markets are closed.")
+            else:
+                print("No results to display.")
     
     else:
-        print(f"\n--- Running Simulation for Prioritization Method: {PRIORITIZATION_METHOD} ---")
-        results = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, verbose=True)
-        print_single_run_details(results)
+        if STRATEGY_TYPE == "BOTH":
+            all_results = []
+            print(f"\n--- Running Simulation for Strategy: NORMAL ---")
+            results_normal = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "NORMAL", verbose=False)
+            performance_normal = calculate_summary_performance(results_normal["portfolio_df"], results_normal["completed_trades"])
+            if performance_normal:
+                performance_normal["Strategy"] = "NORMAL"
+                all_results.append(performance_normal)
+
+            print(f"\n--- Running Simulation for Strategy: INVERSE ---")
+            results_inverse = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "INVERSE", verbose=False)
+            performance_inverse = calculate_summary_performance(results_inverse["portfolio_df"], results_inverse["completed_trades"])
+            if performance_inverse:
+                performance_inverse["Strategy"] = "INVERSE"
+                all_results.append(performance_inverse)
+            
+            print("\n\n--- Overall Performance Summary ---")
+            if all_results:
+                summary_df = pd.DataFrame(all_results).set_index("Strategy")
+                summary_df['Total Return (sort)'] = summary_df['Total Return'].str.replace('%', '').astype(float)
+                summary_df = summary_df.sort_values(by='Total Return (sort)', ascending=False).drop(columns=['Total Return (sort)'])
+                print(summary_df)
+                print("\nNote: Avg Duration omits Saturdays and Sundays because the markets are closed.")
+            else:
+                print("No results to display.")
+        else:
+            print(f"\n--- Running Simulation for Prioritization Method: {PRIORITIZATION_METHOD} ---")
+            results = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, STRATEGY_TYPE, verbose=True)
+            print_single_run_details(results)
 
     elapsed_seconds = time.perf_counter() - start_time
     minutes, seconds = divmod(elapsed_seconds, 60)

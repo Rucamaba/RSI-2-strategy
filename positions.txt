@@ -1,5 +1,0 @@
-BIIB
-CCL
-NCLH
-QCOM
-WFC
