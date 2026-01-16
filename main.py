@@ -1,8 +1,9 @@
 """
-This script monitors a specific ticker to identify buying opportunities
+This script analyzes tickers to identify buying opportunities
 based on the RSI(2) mean-reversion strategy.
 1. Trend Filter: Price > 200-day SMA
 2. Setup: RSI(2) < 5
+3. Sell: Price > 5-day SMA
 """
 
 import yfinance as yf
@@ -72,7 +73,7 @@ def analyze_ticker(ticker_symbol):
     return {
         "ticker": ticker_symbol,
         "price": current_price,
-        "is_buy_signal": is_uptrend and is_oversold,
+        "is_buy_signal": is_uptrend and is_oversold and (current_price < sma5),
         "is_exit_signal": is_exit_zone,
         "is_oversold": is_oversold,
     }
