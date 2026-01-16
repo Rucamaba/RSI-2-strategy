@@ -31,8 +31,8 @@ All simulations were executed with the following standardized parameters to ensu
 --- Overall Performance Summary ---
 | Method   | Final Value | Max Value   | Total Return | Annualized Return | Total Trades | Avg Duration (d) | Winrate |
 |----------|-------------|-------------|--------------|-------------------|--------------|------------------|---------|
-| RSI      | $1,035.27   | $2,003.22 | 314.11%      | 314.51%           | 298          | 3.95             | 71.14%  |
-| RSI_DESC | $1,030.33   | $1,384.79 | 312.13%      | 312.53%           | 297          | 3.88             | 70.71%  |
+| RSI      | $1,035.27   | $2,003.22   | 314.11%      | 314.51%           | 298          | 3.95             | 71.14%  |
+| RSI_DESC | $1,030.33   | $1,384.79   | 312.13%      | 312.53%           | 297          | 3.88             | 70.71%  |
 
 ### Year 2023
 #### S&P 500: 25,86%
@@ -58,8 +58,8 @@ All simulations were executed with the following standardized parameters to ensu
 --- Overall Performance Summary ---
 | Method   | Final Value | Max Value   | Total Return | Annualized Return | Total Trades | Avg Duration (d) | Winrate |
 |----------|-------------|-------------|--------------|-------------------|--------------|------------------|---------|
-| RSI      | $2,680.50   | $3,305.39 | 972.20%      | 980.97%           | 295          | 3.89             | 69.83%  |
-| RSI_DESC | $1,097.08   | $1,336.50 | 338.83%      | 341.07%           | 293          | 3.97             | 65.53%  |
+| RSI      | $2,680.50   | $3,305.39   | 972.20%      | 980.97%           | 295          | 3.89             | 69.83%  |
+| RSI_DESC | $1,097.08   | $1,336.50   | 338.83%      | 341.07%           | 293          | 3.97             | 65.53%  |
 
 ### Year 2020 (COVID-19 Crisis) !!! This backtest ends in March due to bankruptcy !!!
 #### S&P 500: 18,37% (ALL YEAR)
@@ -76,7 +76,7 @@ All simulations were executed with the following standardized parameters to ensu
 --- Overall Performance Summary ---
 | Method   | Final Value | Max Value   | Total Return | Annualized Return | Total Trades | Avg Duration (d) | Winrate |
 |----------|-------------|-------------|--------------|-------------------|--------------|------------------|---------|
-| RSI_DESC | $1,139.24   | $1,144.26 | 355.70%      | 358.07%           | 284          | 3.79             | 76.06%  |
+| RSI_DESC | $1,139.24   | $1,144.26   | 355.70%      | 358.07%           | 284          | 3.79             | 76.06%  |
 | RSI      | $856.44     | $866.95     | 242.58%      | 244.03%           | 277          | 3.82             | 74.01%  |
 
 ### Year 2018
@@ -87,6 +87,18 @@ All simulations were executed with the following standardized parameters to ensu
 |----------|-------------|-----------|--------------|-------------------|--------------|------------------|---------|
 | RSI      | $127.79     | $616.45   | -48.88%      | -49.00%           | 254          | 4.41             | 61.81%  |
 | RSI_DESC | $90.91      | $364.43   | -63.64%      | -63.76%           | 272          | 4.08             | 65.44%  |
+
+
+##### Method winner
+
+2018: RSI (BEARISH) 
+2019: RSI_DESC
+2020: RSI (BANKRUPTCY) 
+2021: RSI
+2022: RSI (BEARISH) 
+2023: RSI_DESC
+2024: RSI
+2025: RSI
 
 ---
 
