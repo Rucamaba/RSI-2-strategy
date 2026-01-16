@@ -20,7 +20,7 @@ The strategy is based on a combination of three key technical indicators to gene
 
 Before running the script, you can customize several parameters in the `CONFIGURATION` section of `backtest.py` to tailor the simulation to your preferences:
 
--   `LEVERAGE_FACTOR`: The level of leverage to use. For example, a value of `5` means a 5:1 ratio, where for every euro of your capital, you control 5 euros in the market.
+-   `LEVERAGE_FACTOR`: The level of leverage to use. For example, a value of `5` means a 5:1 ratio, where for every euro of your capital, you control 5 euros in the market. **Leverage carries significant risk; ensure you understand the risks before trading with leverage**
 -   `INITIAL_CAPITAL`: The initial amount of capital for the backtest (e.g., `250.0`).
 -   `MAX_CONCURRENT_POSITIONS`: The maximum number of positions that can be held open simultaneously.
 -   `START_DATE` and `END_DATE`: The period for which the backtest will be run (e.g., `"2021-01-01"` to `"2025-12-31"`).

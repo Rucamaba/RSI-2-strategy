@@ -19,11 +19,11 @@ import time
 LEVERAGE_FACTOR = 5
 INITIAL_CAPITAL = 250.0
 MAX_CONCURRENT_POSITIONS = 5
-START_DATE = "2021-01-01"
-END_DATE = "2025-12-31"
+START_DATE = "2018-01-01"
+END_DATE = "2018-12-31"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
-PRIORITIZATION_METHOD = 'ALL' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', 'ADX_ASC', or 'ALL'
-ALL_METHODS = ['RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', 'ADX_ASC']
+PRIORITIZATION_METHOD = ['RSI', 'RSI_DESC'] # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
+ALL_METHODS = ['RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC']
 # ==============================================================================
 # ==============================================================================
 
@@ -110,7 +110,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, ver
                 signal_data = all_historical_data[ticker].loc[date]
                 pnl = (signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"]
                 cash += pos_info["investment_cost"] + pnl
-                duration = (date - pos_info["buy_date"]).days
+                duration = np.busday_count(pos_info["buy_date"].date(), date.date())
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
                 print(f"{date.date()}: LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f}")
                 del positions[ticker]
@@ -125,7 +125,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, ver
                 pos_info = positions[ticker]
                 pnl = (signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"]
                 cash += pos_info["investment_cost"] + pnl
-                duration = (date - pos_info["buy_date"]).days
+                duration = np.busday_count(pos_info["buy_date"].date(), date.date())
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
                 print(f"{date.date()}: SELL {'{:.2f}'.format(pos_info['quantity'])} of {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f}")
                 del positions[ticker]
@@ -158,8 +158,6 @@ def run_simulation(all_historical_data, master_index, prioritization_method, ver
                 sorted_buys = sorted(potential_buys, key=lambda x: x['hv'] if not pd.isna(x['hv']) else 0, reverse=True)
             elif prioritization_method == 'ADX_DESC':
                 sorted_buys = sorted(potential_buys, key=lambda x: x['adx'] if not pd.isna(x['adx']) else 0, reverse=True)
-            elif prioritization_method == 'ADX_ASC':
-                sorted_buys = sorted(potential_buys, key=lambda x: x['adx'] if not pd.isna(x['adx']) else 999)
             else: # Default to RSI ASC if method is unknown
                 sorted_buys = sorted(potential_buys, key=lambda x: x['rsi'])
 
@@ -282,25 +280,27 @@ if __name__ == '__main__':
     
     all_historical_data, master_index = prepare_data(unique_tickers)
     
-    if PRIORITIZATION_METHOD == 'ALL':
+    if isinstance(PRIORITIZATION_METHOD, list) or PRIORITIZATION_METHOD == 'ALL':
+        methods_to_run = PRIORITIZATION_METHOD if isinstance(PRIORITIZATION_METHOD, list) else ALL_METHODS
         all_results = []
-        for method in ALL_METHODS:
+        for method in methods_to_run:
             print(f"\n--- Running Simulation for Prioritization Method: {method} ---")
             results = run_simulation(all_historical_data, master_index, method, verbose=False)
             performance = calculate_summary_performance(results["portfolio_df"], results["completed_trades"])
             if performance:
                 performance["Method"] = method
                 all_results.append(performance)
-        
+            
         print("\n\n--- Overall Performance Summary ---")
         if all_results:
             summary_df = pd.DataFrame(all_results).set_index("Method")
             summary_df['Total Return (sort)'] = summary_df['Total Return'].str.replace('%', '').astype(float)
             summary_df = summary_df.sort_values(by='Total Return (sort)', ascending=False).drop(columns=['Total Return (sort)'])
             print(summary_df)
+            print("\nNote: Avg Duration omits Saturdays and Sundays because the markets are closed.")
         else:
             print("No results to display.")
-
+    
     else:
         print(f"\n--- Running Simulation for Prioritization Method: {PRIORITIZATION_METHOD} ---")
         results = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, verbose=True)

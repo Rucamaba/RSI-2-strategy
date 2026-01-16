@@ -22,16 +22,8 @@ def get_tickers_from_csv(file_path, ticker_column="Ticker"):
         return []
     
     try:
-        df = pd.read_csv(file_path)
-        if ticker_column not in df.columns:
-            # Try to find a common alternative column name like 'Symbol'
-            if "Symbol" in df.columns:
-                ticker_column = "Symbol"
-            else:
-                print(f"Warning: Column '{ticker_column}' not found in '{file_path}'. Check the file. Skipping.")
-                return []
-        
-        tickers = df[ticker_column].dropna().tolist()
+        df = pd.read_csv(file_path, header=None)
+        tickers = df[0].dropna().tolist()
         return tickers
     except Exception as e:
         print(f"Error reading CSV file '{file_path}': {e}")

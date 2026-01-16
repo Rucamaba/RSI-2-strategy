@@ -19,6 +19,17 @@ The script performs the following steps in sequence:
     -   **Potential Signal (Yellow)**: If only the RSI condition is met, it prints a "Potential" signal in yellow. This indicates that the stock is in a short-term pullback but not yet in a long-term uptrend, so it's worth watching.
 6.  **Update Positions**: After scanning all the tickers, the `positions.txt` file is updated with any new buy signals.
 
+## Prioritization Methods
+
+The script can sort the buy signals based on different criteria. You can choose the prioritization method by changing the `PRIORITIZATION_METHOD` variable at the beginning of the script. The available options are:
+
+-   `'RSI'`: Sorts the signals by the lowest RSI value, prioritizing the most oversold stocks.
+-   `'RSI_DESC'`: Sorts the signals by the highest RSI value. Always with RSI < 5.
+-   `'A-Z'`: Sorts the signals alphabetically by ticker symbol.
+-   `'Z-A'`: Sorts the signals in reverse alphabetical order by ticker symbol.
+-   `'HV_DESC'`: Sorts the signals by the highest historical volatility, prioritizing the most volatile stocks.
+-   `'ADX_DESC'`: Sorts the signals by the highest ADX value, prioritizing the stocks with the strongest trends. Since all our buy signals are above the 200-day SMA, it will always indicate an upward trend.
+
 ## How to Use
 
 To run the script, simply execute the following command in your terminal:

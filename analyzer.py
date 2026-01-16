@@ -10,7 +10,11 @@ import yfinance as yf
 import pandas_ta as ta
 import pandas as pd
 import os
+import numpy as np
 from markets import get_tickers_from_csv
+
+# --- CONFIGURATION ---
+PRIORITIZATION_METHOD = "RSI"  # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC'
 
 POSITIONS_FILE = "positions.txt"
 
@@ -54,12 +58,24 @@ def analyze_ticker(ticker_symbol):
     df["SMA_200"] = ta.sma(df["close"], length=200)
     df["SMA_5"] = ta.sma(df["close"], length=5)
     df["RSI_2"] = ta.rsi(df["close"], length=2)
+    df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
+    df['hv_100'] = df['log_returns'].rolling(window=100).std() * np.sqrt(252)
+    if all(c in df.columns for c in ['high', 'low', 'close']):
+        adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
+        if adx_df is not None and not adx_df.empty:
+            df['adx_14'] = adx_df.iloc[:, 0]
+        else:
+            df['adx_14'] = np.nan
+    else:
+        df['adx_14'] = np.nan
 
     # Get the latest data
     current_price = df["close"].iloc[-1]
     rsi2 = df["RSI_2"].iloc[-1]
     sma200 = df["SMA_200"].iloc[-1]
     sma5 = df["SMA_5"].iloc[-1]
+    hv = df["hv_100"].iloc[-1]
+    adx = df["adx_14"].iloc[-1]
 
     # Ensure we have valid indicator values
     if pd.isna(sma200) or pd.isna(sma5) or pd.isna(rsi2):
@@ -76,7 +92,10 @@ def analyze_ticker(ticker_symbol):
         "is_buy_signal": is_uptrend and is_oversold and (current_price < sma5),
         "is_exit_signal": is_exit_zone,
         "is_oversold": is_oversold,
-    }
+                "rsi": rsi2,
+                "hv": hv,
+                "adx": adx
+            }
 
 if __name__ == "__main__":
     # 1. Load tickers of currently held positions
@@ -96,38 +115,66 @@ if __name__ == "__main__":
                 new_positions.remove(ticker)
 
     # 3. Check for new BUY signals in the market
-    print("\n--- Checking for NEW BUY signals from market CSV files ---")
-    market_files = [
-        "data/ibex35.csv",
-        "data/nasdaq100.csv",
-        "data/sp500.csv"
-    ]
-    all_tickers = []
-    for f in market_files:
-        all_tickers.extend(get_tickers_from_csv(f))
-
-    print(f"--> Loaded {len(all_tickers)} total tickers.")
-    
-    # Remove duplicates for efficiency, as some tickers are in multiple indices
-    unique_tickers = sorted(list(set(all_tickers)))
-    
-    if len(unique_tickers) < len(all_tickers):
+        print("\n--- Scanning for new BUY signals ---")
+        market_files = [os.path.join("data", f) for f in os.listdir("data") if f.endswith(".csv")]
+        all_tickers = []
+        for f in market_files:
+                all_tickers.extend(get_tickers_from_csv(f))
+            
+        unique_tickers = sorted(list(set(all_tickers)))
         print(f"--> Analyzing {len(unique_tickers)} unique tickers after removing {len(all_tickers) - len(unique_tickers)} duplicates.")
+        all_tickers = unique_tickers
+        
+        buy_signals = []
+        potential_signals = []
     
-    for ticker in unique_tickers:
-        if ticker in new_positions:
-            continue  # Skip if we already have a position
-
-        print(f"Analyzing market for: {ticker}...")
-        analysis = analyze_ticker(ticker)
-        if analysis:
+        for ticker in all_tickers:
+            if ticker in held_positions:
+                continue
+            
+            print(f"Analyzing new ticker: {ticker}...")
+            analysis = analyze_ticker(ticker)
+    
+            if not analysis:
+                continue
+            
             if analysis["is_buy_signal"]:
-                print(f"{Colors.GREEN}!!! BUY SIGNAL for {analysis['ticker']} at price {analysis['price']:.2f} !!!{Colors.RESET}")
-                new_positions.append(ticker)
+                buy_signals.append(analysis)
+                print(f"{Colors.GREEN}BUY SIGNAL: {ticker} @ ${analysis['price']:.2f}{Colors.RESET}")
+                if ticker not in new_positions:
+                    new_positions.append(ticker)
             elif analysis["is_oversold"]:
-                print(f"{Colors.YELLOW}--- Potential Signal (RSI<5 BUT DON'T BUY) for {analysis['ticker']} at price {analysis['price']:.2f} ---{Colors.RESET}")
+                potential_signals.append(analysis)
+        
+        print("\n--- Summary ---")
+        if not buy_signals and not potential_signals:
+            print("No new signals found.")
+        else:
+            if buy_signals:
+                print(f"\n--- Strong Buy Signals (Sorted by {PRIORITIZATION_METHOD}) ---")
+                # Sort signals based on the chosen method
+                if PRIORITIZATION_METHOD == 'RSI':
+                    buy_signals.sort(key=lambda x: x['rsi'])
+                elif PRIORITIZATION_METHOD == 'RSI_DESC':
+                    buy_signals.sort(key=lambda x: x['rsi'], reverse=True)
+                elif PRIORITIZATION_METHOD == 'A-Z':
+                    buy_signals.sort(key=lambda x: x['ticker'])
+                elif PRIORITIZATION_METHOD == 'Z-A':
+                    buy_signals.sort(key=lambda x: x['ticker'], reverse=True)
+                elif PRIORITIZATION_METHOD == 'HV_DESC':
+                    buy_signals.sort(key=lambda x: x['hv'] if not pd.isna(x['hv']) else 0, reverse=True)
+                elif PRIORITIZATION_METHOD == 'ADX_DESC':
+                    buy_signals.sort(key=lambda x: x['adx'] if not pd.isna(x['adx']) else 0, reverse=True)
+                
+                for signal in buy_signals:
+                    print(f"{Colors.GREEN}BUY: {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}, HV: {signal.get('hv', 0):.2f}, ADX: {signal.get('adx', 0):.2f}){Colors.RESET}")
+    
+            if potential_signals:
+                print("\n--- Potential Signals (Watchlist) ---")
+                potential_signals.sort(key=lambda x: x['rsi'])
+                for signal in potential_signals:
+                    print(f"{Colors.YELLOW}WATCH: {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}){Colors.RESET}")
 
-    # 4. Save the updated list of positions
-    save_positions(new_positions)
-    print(f"\n--- Analysis complete. Updated positions saved to {POSITIONS_FILE}. ---")
-    print(f"Current positions: {new_positions}")
+    # 4. Save updated positions
+        save_positions(new_positions)
+        print("\nPositions file updated.")
