@@ -94,13 +94,15 @@ def analyze_ticker(ticker_symbol):
         "is_oversold": is_oversold,
                 "rsi": rsi2,
                 "hv": hv,
-                "adx": adx
+                "adx": adx,
+                "sma5": sma5
             }
 
 if __name__ == "__main__":
     # 1. Load tickers of currently held positions
     held_positions = load_positions()
     new_positions = held_positions.copy()
+    exit_signals = []
 
     # 2. Check for EXIT signals in currently held positions
     print("--- Checking for EXIT signals in held positions ---")
@@ -112,69 +114,77 @@ if __name__ == "__main__":
             analysis = analyze_ticker(ticker)
             if analysis and analysis["is_exit_signal"]:
                 print(f"{Colors.RED}!!! EXIT SIGNAL for {analysis['ticker']} at price {analysis['price']:.2f} !!!{Colors.RESET}")
-                new_positions.remove(ticker)
+                exit_signals.append(analysis)
+                if ticker in new_positions:
+                    new_positions.remove(ticker)
 
     # 3. Check for new BUY signals in the market
-        print("\n--- Scanning for new BUY signals ---")
-        market_files = [os.path.join("data", f) for f in os.listdir("data") if f.endswith(".csv")]
-        all_tickers = []
-        for f in market_files:
-                all_tickers.extend(get_tickers_from_csv(f))
-            
-        unique_tickers = sorted(list(set(all_tickers)))
-        print(f"--> Analyzing {len(unique_tickers)} unique tickers after removing {len(all_tickers) - len(unique_tickers)} duplicates.")
-        all_tickers = unique_tickers
+    print("\n--- Scanning for new BUY signals ---")
+    market_files = [os.path.join("data", f) for f in os.listdir("data") if f.endswith(".csv")]
+    all_tickers = []
+    for f in market_files:
+            all_tickers.extend(get_tickers_from_csv(f))
         
-        buy_signals = []
-        potential_signals = []
+    unique_tickers = sorted(list(set(all_tickers)))
+    print(f"--> Analyzing {len(unique_tickers)} unique tickers after removing {len(all_tickers) - len(unique_tickers)} duplicates.")
+    all_tickers = unique_tickers
     
-        for ticker in all_tickers:
-            if ticker in held_positions:
-                continue
-            
-            print(f"Analyzing new ticker: {ticker}...")
-            analysis = analyze_ticker(ticker)
-    
-            if not analysis:
-                continue
-            
-            if analysis["is_buy_signal"]:
-                buy_signals.append(analysis)
-                print(f"{Colors.GREEN}BUY SIGNAL: {ticker} @ ${analysis['price']:.2f}{Colors.RESET}")
-                if ticker not in new_positions:
-                    new_positions.append(ticker)
-            elif analysis["is_oversold"]:
-                potential_signals.append(analysis)
+    buy_signals = []
+    potential_signals = []
+
+    for ticker in all_tickers:
+        if ticker in held_positions:
+            continue
         
-        print("\n--- Summary ---")
-        if not buy_signals and not potential_signals:
-            print("No new signals found.")
-        else:
-            if buy_signals:
-                print(f"\n--- Strong Buy Signals (Sorted by {PRIORITIZATION_METHOD}) ---")
-                # Sort signals based on the chosen method
-                if PRIORITIZATION_METHOD == 'RSI':
-                    buy_signals.sort(key=lambda x: x['rsi'])
-                elif PRIORITIZATION_METHOD == 'RSI_DESC':
-                    buy_signals.sort(key=lambda x: x['rsi'], reverse=True)
-                elif PRIORITIZATION_METHOD == 'A-Z':
-                    buy_signals.sort(key=lambda x: x['ticker'])
-                elif PRIORITIZATION_METHOD == 'Z-A':
-                    buy_signals.sort(key=lambda x: x['ticker'], reverse=True)
-                elif PRIORITIZATION_METHOD == 'HV_DESC':
-                    buy_signals.sort(key=lambda x: x['hv'] if not pd.isna(x['hv']) else 0, reverse=True)
-                elif PRIORITIZATION_METHOD == 'ADX_DESC':
-                    buy_signals.sort(key=lambda x: x['adx'] if not pd.isna(x['adx']) else 0, reverse=True)
-                
-                for signal in buy_signals:
-                    print(f"{Colors.GREEN}BUY: {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}, HV: {signal.get('hv', 0):.2f}, ADX: {signal.get('adx', 0):.2f}){Colors.RESET}")
+        print(f"Analyzing new ticker: {ticker}...")
+        analysis = analyze_ticker(ticker)
+
+        if not analysis:
+            continue
+        
+        if analysis["is_buy_signal"]:
+            buy_signals.append(analysis)
+            print(f"{Colors.GREEN}BUY SIGNAL: {ticker} @ ${analysis['price']:.2f} (Approx. Take Profit: ${analysis['sma5']:.2f}){Colors.RESET}")
+            if ticker not in new_positions:
+                new_positions.append(ticker)
+        elif analysis["is_oversold"]:
+            potential_signals.append(analysis)
     
-            if potential_signals:
-                print("\n--- Potential Signals (Watchlist) ---")
-                potential_signals.sort(key=lambda x: x['rsi'])
-                for signal in potential_signals:
-                    print(f"{Colors.YELLOW}WATCH: {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}){Colors.RESET}")
+    print("\n--- Summary ---")
+    if not buy_signals and not potential_signals and not exit_signals:
+        print("No signals found.")
+    else:
+        if exit_signals:
+            print("\n--- Exit Signals ---")
+            exit_signals.sort(key=lambda x: x['ticker'])
+            for signal in exit_signals:
+                print(f"{Colors.RED}EXIT: {signal['ticker']} @ ${signal['price']:.2f}{Colors.RESET}")
+
+        if buy_signals:
+            print(f"\n--- Strong Buy Signals (Sorted by {PRIORITIZATION_METHOD}) ---")
+            # Sort signals based on the chosen method
+            if PRIORITIZATION_METHOD == 'RSI':
+                buy_signals.sort(key=lambda x: x['rsi'])
+            elif PRIORITIZATION_METHOD == 'RSI_DESC':
+                buy_signals.sort(key=lambda x: x['rsi'], reverse=True)
+            elif PRIORITIZATION_METHOD == 'A-Z':
+                buy_signals.sort(key=lambda x: x['ticker'])
+            elif PRIORITIZATION_METHOD == 'Z-A':
+                buy_signals.sort(key=lambda x: x['ticker'], reverse=True)
+            elif PRIORITIZATION_METHOD == 'HV_DESC':
+                buy_signals.sort(key=lambda x: x['hv'] if not pd.isna(x['hv']) else 0, reverse=True)
+            elif PRIORITIZATION_METHOD == 'ADX_DESC':
+                buy_signals.sort(key=lambda x: x['adx'] if not pd.isna(x['adx']) else 0, reverse=True)
+            
+            for signal in buy_signals:
+                print(f"{Colors.GREEN}BUY: {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}, HV: {signal.get('hv', 0):.2f}, ADX: {signal.get('adx', 0):.2f}, Approx. Take Profit: ${signal['sma5']:.2f}){Colors.RESET}")
+
+        if potential_signals:
+            print("\n--- Potential Signals (Watchlist) ---")
+            potential_signals.sort(key=lambda x: x['rsi'])
+            for signal in potential_signals:
+                print(f"{Colors.YELLOW}WATCH: {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}){Colors.RESET}")
 
     # 4. Save updated positions
-        save_positions(new_positions)
-        print("\nPositions file updated.")
+    save_positions(new_positions)
+    print("\nPositions file updated.")
