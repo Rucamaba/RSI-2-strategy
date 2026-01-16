@@ -6,18 +6,6 @@ This project is an automated stock screening tool that scans multiple markets to
 
 This project is a significantly modified and extended version of the original [rsi2-bot](https://github.com/youngha-mikoto/rsi2-bot) by youngha-mikoto. Credit for the core strategy and initial implementation goes to the original author.
 
-## Features
-
-- **Multi-Market Analysis**: Scans a configurable list of markets by reading ticker symbols from CSV files located in the `data/` directory.
-- **Flexible Strategy**: Implements the RSI(2) trading strategy, checking for stocks that are above their 200-day moving average but have a 2-period RSI below a set threshold (currently 5).
-- **Dual Signal System**: 
-    -   **BUY Signal (Green)**: Triggered when all strategy conditions are met.
-    -   **Potential Signal (Yellow)**: Triggered when only the RSI condition is met, indicating a stock to watch.
-- **Position Tracking**: Automatically saves all confirmed BUY signals to `positions.txt` to track a portfolio of held assets.
-- **Exit Signal Monitoring**: On each run, it first checks all held positions for an exit signal (price closing above the 5-day moving average) and prints a notification (in Red).
-- **Efficient & Clean**: De-duplicates tickers found in multiple market lists to avoid redundant analysis.
-- **Ticker Generation**: Includes a helper script (`generate_tickers.py`) to automatically create a list of S&P 500 companies.
-
 ## The Strategy
 
 This screener is based on a strategy popularized by Larry Connors.
@@ -27,6 +15,15 @@ This screener is based on a strategy popularized by Larry Connors.
     2. The stock's 2-period Relative Strength Index (RSI) must be below 5.
 - **Exit Condition**:
     1. The stock's current price must be above its 5-day Simple Moving Average (SMA).
+
+## How it Works
+
+The project is divided into several scripts, each with a specific purpose:
+
+- **`analyzer.py`**: This is the main script that orchestrates the entire process. It reads the markets to be analyzed, checks for exit signals on existing positions, and scans for new buy signals.
+- **`markets.py`**: This script is responsible for loading the ticker symbols from the CSV files located in the `data/` directory. It also handles the de-duplication of tickers found in multiple market lists.
+- **`backtest.py`**: This script allows you to backtest the strategy on a single ticker. It will generate a detailed report with the results of the backtest.
+- **`generate_tickers.py`**: This is a helper script to automatically create a list of S&P 500 (or other markets) companies and save it as a CSV file in the `data/` directory.
 
 ## Setup & Installation
 
@@ -54,7 +51,7 @@ This screener is based on a strategy popularized by Larry Connors.
 Simply run the main script from your terminal:
 
 ```bash
-python main.py
+python analyzer.py
 ```
 
 The script will:
@@ -62,3 +59,12 @@ The script will:
 2.  Scan all tickers from the `.csv` files in the `data/` directory for new signals.
 3.  Print any BUY, EXIT, or Potential signals it finds, with colors for easy identification.
 4.  Update `positions.txt` with any new BUY signals. You can modify this file with your open positions.
+
+## Documentation
+
+For more detailed information about each script, please refer to the documentation in the `docs/` directory:
+
+- [`analyzer.py` - User Manual](docs/ANALYZER_DOCUMENTATION.md)
+- [`backtest.py` - User Manual](docs/BACKTEST_DOCUMENTATION.md)
+- [`generate_tickers.py` - User Manual](docs/GENERATE_TICKERS_DOCUMENTATION.md)
+- [`markets.py` - User Manual](docs/MARKETS_DOCUMENTATION.md)

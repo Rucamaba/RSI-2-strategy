@@ -95,3 +95,5 @@ ADX_ASC    $2,028.62   $7,359.77      711.45%            52.05%          1323   
 ADX_DESC   $1,687.18   $4,741.46      574.87%            46.54%          1315             5.87  65.93%
 HV_DESC     $-769.34  $13,792.30     -407.73%             0.00%          1099             5.86  66.42%
 ```
+### REMINDER: Past performance is not indicative of future results. 
+### Invest responsibly and conduct your own research.
