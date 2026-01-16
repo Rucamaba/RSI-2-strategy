@@ -89,16 +89,18 @@ All simulations were executed with the following standardized parameters to ensu
 | RSI_DESC | $90.91      | $364.43   | -63.64%      | -63.76%           | 272          | 4.08             | 65.44%  |
 
 
-##### Method winner
+#### Method winner
 
-| 2018 | RSI (BEARISH) |
-| 2019 | RSI_DESC |
-| 2020 | RSI (BANKRUPTCY) |
-| 2021 | RSI |
-| 2022 | RSI (BEARISH) | 
-| 2023 | RSI_DESC |
-| 2024 | RSI |
-| 2025 | RSI |
+| Year | Winning Method | Result |
+| :--- | :--- | :--- |
+| 2018 | RSI | Bearish |
+| 2019 | RSI_DESC | Bullish |
+| 2020 | RSI | Bankruptcy |
+| 2021 | RSI | Bullish |
+| 2022 | RSI | Bearish |
+| 2023 | RSI_DESC | Bullish |
+| 2024 | RSI | Bullish |
+| 2025 | RSI | Bullish |
 
 ---
 
