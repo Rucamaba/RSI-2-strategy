@@ -26,7 +26,7 @@ PRIORITIZATION_METHOD = 'RSI' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DE
 ALL_METHODS = ['RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC']
 # ==============================================================================
 # ==============================================================================
-STRATEGY_TYPE = "BOTH" # Options: "NORMAL", "INVERSE", "BOTH"
+STRATEGY_TYPE = "NORMAL" # Options: "NORMAL", "INVERSE", "BOTH"
 # ==============================================================================
 # ==============================================================================
 
@@ -240,7 +240,8 @@ def print_single_run_details(results):
 
     print("\n--- Backtest Finished: Performance Summary ---")
     summary = calculate_summary_performance(portfolio_df, completed_trades)
-    initial_value = portfolio_df['value'].iloc[0]
+    first_valid_index = portfolio_df['value'].first_valid_index()
+    initial_value = portfolio_df.loc[first_valid_index]['value'] if first_valid_index is not None else float('nan')
     max_portfolio_value = portfolio_df['value'].max()
     print(f"Initial Portfolio Value: ${initial_value:,.2f}")
     print(f"Max Portfolio Value:     ${max_portfolio_value:,.2f}")
