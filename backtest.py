@@ -1,8 +1,8 @@
 """
 This script do a backtest of the trading strategy based on the RSI(2) mean-reversion strategy.
-1. Trend Filter: Price > 200-day SMA 
+1. Trend Filter: Price > 200-day SMA && S&P 500 > (200-day SMA * SP500_ENTRY_THRESHOLD) && VIX < VIX_PROTECTION
 2. Setup: RSI(2) < 5
-3. Sell: Price > 5-day SMA
+3. Sell: Price > 5-day SMA OR TIME_STOP
 """
 
 import pandas as pd
@@ -17,16 +17,20 @@ import time
 # --- CONFIGURATION ---
 # ==============================================================================
 LEVERAGE_FACTOR = 5
-INITIAL_CAPITAL = 250.0
-MAX_CONCURRENT_POSITIONS = 5
-START_DATE = "2025-01-01"
-END_DATE = "2025-12-31"
+INITIAL_CAPITAL = 350.0
+MAX_CONCURRENT_POSITIONS = 8
+START_DATE = "2007-10-01" # YYYY-MM-DD
+END_DATE = "2009-03-31"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
-PRIORITIZATION_METHOD = 'RSI' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
+# ==============================================================================
+PRIORITIZATION_METHOD = ['RSI', 'RSI_DESC'] # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
 ALL_METHODS = ['RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC']
-# ==============================================================================
-# ==============================================================================
 STRATEGY_TYPE = "NORMAL" # Options: "NORMAL", "INVERSE", "BOTH"
+# ==============================================================================
+VIX_PROTECTION = 45 # VIX threshold to shut off system (0 = disabled). System reactivates when VIX < threshold * 0.8
+PANIC_BUTTON = False # If True, sell all open positions when VIX protection is triggered
+TIME_STOP = 10 # Maximum number of days to hold a position (0 = disabled)
+SP500_ENTRY_THRESHOLD = 1.02 # S&P 500 must be above SMA(200) * this value to open positions (e.g., 1.01 = 1% above SMA)
 # ==============================================================================
 # ==============================================================================
 
@@ -34,6 +38,25 @@ def prepare_data(tickers):
     print(f"Step 1: Downloading historical data... (Leverage: 1:{LEVERAGE_FACTOR})")
     all_historical_data = {}
     data_start_date = pd.to_datetime(START_DATE) - pd.DateOffset(months=10)
+
+    # Download S&P 500 data for market trend filter
+    sp500_data = yf.download('^GSPC', start=data_start_date, end=END_DATE, progress=False)
+    if sp500_data.empty:
+        print("Warning: Could not download S&P 500 data. Market trend filter will be disabled.")
+        sp500_data = None
+    else:
+        if isinstance(sp500_data.columns, pd.MultiIndex):
+            sp500_data.columns = sp500_data.columns.droplevel(1)
+        sp500_data.columns = [str(col).lower() for col in sp500_data.columns]
+        sp500_data['sma_200'] = ta.sma(sp500_data['close'], length=200)
+
+    # Download VIX data
+    vix_data = yf.download('^VIX', start=data_start_date, end=END_DATE, progress=False)
+    if vix_data.empty:
+        print("Warning: Could not download VIX data. VIX protection will be disabled.")
+        vix_data = None
+    else:
+        vix_data = vix_data[['Close']].rename(columns={'Close': 'vix_close'})
     # Batch download to be friendlier to the API
     for i in range(0, len(tickers), 100):
         batch = tickers[i:i+100]
@@ -54,6 +77,10 @@ def prepare_data(tickers):
     print("Step 2: Unifying and forward-filling data...")
     master_index = pd.DatetimeIndex([])
     for df in all_historical_data.values(): master_index = master_index.union(df.index)
+    if vix_data is not None:
+        vix_data = vix_data.reindex(master_index, method='ffill')
+    if sp500_data is not None:
+        sp500_data = sp500_data.reindex(master_index, method='ffill')
     for ticker in all_historical_data: all_historical_data[ticker] = all_historical_data[ticker].reindex(master_index, method='ffill')
 
     print("Step 3: Pre-calculating signals...")
@@ -93,11 +120,16 @@ def prepare_data(tickers):
     
     for ticker in tickers_to_remove:
         del all_historical_data[ticker]
-    return all_historical_data, master_index
+    
+    if vix_data is not None:
+        return all_historical_data, master_index, vix_data, sp500_data
+    return all_historical_data, master_index, None, None
 
-def run_simulation(all_historical_data, master_index, prioritization_method, strategy_type, verbose=True):
+def run_simulation(all_historical_data, master_index, prioritization_method, strategy_type, vix_data, sp500_data, verbose=True):
     cash = INITIAL_CAPITAL
     portfolio_value_history, positions, completed_trades = [], {}, []
+    system_shut_off = False
+    previous_system_state = False  # Track previous state to detect changes
     
     for date in master_index:
         if date < pd.to_datetime(START_DATE): continue
@@ -118,7 +150,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                 signal_data = all_historical_data[ticker].loc[date]
                 pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
                 cash += pos_info["investment_cost"] + pnl
-                duration = np.busday_count(pos_info["buy_date"].date(), date.date())
+                duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
                 print(f"{date.date()}: LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f}")
                 del positions[ticker]
@@ -127,20 +159,105 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
             portfolio_value_history.append({"date": date, "value": cash}) # Final value is remaining cash
             break
 
+        # Close positions (including TIME_STOP check) - this ALWAYS runs regardless of system_shut_off
         for ticker in list(positions.keys()):
             signal_data = all_historical_data[ticker].loc[date]
             exit_signal = f"is_exit_signal_{strategy_type.lower()}"
-            if signal_data[exit_signal]:
-                pos_info = positions[ticker]
+            pos_info = positions[ticker]
+            
+            # Check for TIME_STOP condition (business days only, excluding weekends)
+            time_stop_triggered = False
+            if TIME_STOP > 0:
+                days_held = np.busday_count(pos_info["buy_date"].date(), date.date())
+                if days_held >= TIME_STOP:
+                    time_stop_triggered = True
+            
+            if signal_data[exit_signal] or time_stop_triggered:
                 pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
                 cash += pos_info["investment_cost"] + pnl
-                duration = np.busday_count(pos_info["buy_date"].date(), date.date())
+                duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Use business days
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
-                print(f"{date.date()}: SELL {'{:.2f}'.format(pos_info['quantity'])} of {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f}")
+                exit_reason = "TIME_STOP" if time_stop_triggered else "Price > SMA(5)"
+                if verbose:
+                    print(f"{date.date()}: SELL {'{:.2f}'.format(pos_info['quantity'])} of {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} ({exit_reason}) [Days: {duration}]")
                 del positions[ticker]
+
+        # VIX Protection and System State Logic - this affects NEW ENTRIES only
+        # Always evaluate system state based on VIX (if enabled) and S&P 500 trend
+        vix_value = None
+        vix_reactivation_threshold = None
+        
+        if VIX_PROTECTION > 0 and vix_data is not None and date in vix_data.index:
+            vix_value = vix_data.loc[date, 'vix_close']
+            if isinstance(vix_value, pd.Series):
+                vix_value = vix_value.iloc[0]
+            vix_reactivation_threshold = VIX_PROTECTION * 0.8
+        
+        # Get S&P 500 data for trend analysis (always needed for system state)
+        sp500_price = sp500_data.loc[date, 'close'] if sp500_data is not None else None
+        sp500_sma200 = sp500_data.loc[date, 'sma_200'] if sp500_data is not None else None
+        if isinstance(sp500_price, pd.Series):
+            sp500_price = sp500_price.iloc[0]
+        if isinstance(sp500_sma200, pd.Series):
+            sp500_sma200 = sp500_sma200.iloc[0]
+        
+        # Shutdown condition: Price < SMA200
+        is_sp500_bearish = pd.notna(sp500_price) and pd.notna(sp500_sma200) and sp500_price < sp500_sma200
+        
+        # Reactivation condition: Price > SMA200 * SP500_ENTRY_THRESHOLD
+        is_sp500_strong = pd.notna(sp500_price) and pd.notna(sp500_sma200) and sp500_price > (sp500_sma200 * SP500_ENTRY_THRESHOLD)
+        
+        # State change logic
+        if not system_shut_off:
+            # Check if system should shut off
+            if vix_value is not None and vix_value > VIX_PROTECTION:
+                system_shut_off = True
+                print(f"\033[93m{date.date()}: System shut off because VIX > {VIX_PROTECTION} (VIX: {vix_value:.2f})\033[0m")
+                if PANIC_BUTTON and positions:
+                    print(f"\033[91m{date.date()}: PANIC BUTTON ACTIVATED. Liquidating all open positions.\033[0m")
+                    for ticker in list(positions.keys()):
+                        pos_info = positions[ticker]
+                        signal_data = all_historical_data[ticker].loc[date]
+                        pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
+                        cash += pos_info["investment_cost"] + pnl
+                        duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
+                        completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
+                        print(f"\033[91m{date.date()}: VIX LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f}\033[0m")
+                        del positions[ticker]
+            elif is_sp500_bearish:
+                system_shut_off = True
+                sp500_price_str = f"{sp500_price:.2f}" if pd.notna(sp500_price) else "N/A"
+                sp500_sma200_str = f"{sp500_sma200:.2f}" if pd.notna(sp500_sma200) else "N/A"
+                print(f"\033[93m{date.date()}: System shut off because S&P500 downtrend (Price: {sp500_price_str} < SMA200: {sp500_sma200_str})\033[0m")
+        else: 
+            # System is shut off - check if it should turn back on
+            vix_condition_ok = vix_value is None or vix_value < vix_reactivation_threshold
+            sp500_condition_ok = is_sp500_strong
+            
+            if vix_condition_ok and sp500_condition_ok:
+                system_shut_off = False
+                sp500_price_str = f"{sp500_price:.2f}" if pd.notna(sp500_price) else "N/A"
+                sp500_sma200_str = f"{sp500_sma200:.2f}" if pd.notna(sp500_sma200) else "N/A"
+                sp500_threshold_str = f"{sp500_sma200 * SP500_ENTRY_THRESHOLD:.2f}" if pd.notna(sp500_sma200) else "N/A"
+                if vix_value is not None:
+                    print(f"\033[92m{date.date()}: System shut on | VIX: {vix_value:.2f} < {vix_reactivation_threshold:.2f} | S&P500: {sp500_price_str} > SMA200: {sp500_sma200_str} (threshold: {sp500_threshold_str})\033[0m")
+                else:
+                    print(f"\033[92m{date.date()}: System shut on | S&P500: {sp500_price_str} > SMA200: {sp500_sma200_str} (threshold: {sp500_threshold_str})\033[0m")
+        
+        previous_system_state = system_shut_off
+        
+        # Skip opening new positions if system is shut off
+        if system_shut_off:
+            portfolio_value_history.append({"date": date, "value": total_portfolio_value})
+            continue
 
         open_slots = MAX_CONCURRENT_POSITIONS - len(positions)
         if open_slots > 0:
+            # S&P 500 Market Trend Filter - use the is_sp500_strong variable calculated earlier
+            if not is_sp500_strong:
+                portfolio_value_history.append({"date": date, "value": total_portfolio_value})
+                continue
+            
             potential_buys = []
             for ticker in all_historical_data.keys():
                 if ticker not in positions:
@@ -289,7 +406,7 @@ if __name__ == '__main__':
     unique_tickers = sorted(list(set(all_tickers)))
     print(f"Loaded {len(unique_tickers)} unique tickers.")
     
-    all_historical_data, master_index = prepare_data(unique_tickers)
+    all_historical_data, master_index, vix_data, sp500_data = prepare_data(unique_tickers)
     
     if isinstance(PRIORITIZATION_METHOD, list) or PRIORITIZATION_METHOD == 'ALL':
         methods_to_run = PRIORITIZATION_METHOD if isinstance(PRIORITIZATION_METHOD, list) else ALL_METHODS
@@ -304,7 +421,7 @@ if __name__ == '__main__':
             all_results = []
             for method in methods_to_run:
                 print(f"--- Prioritization Method: {method} ---")
-                results = run_simulation(all_historical_data, master_index, method, strategy, verbose=False)
+                results = run_simulation(all_historical_data, master_index, method, strategy, vix_data, sp500_data, verbose=False)
                 performance = calculate_summary_performance(results["portfolio_df"], results["completed_trades"])
                 if performance:
                     performance["Method"] = method
@@ -324,14 +441,14 @@ if __name__ == '__main__':
         if STRATEGY_TYPE == "BOTH":
             all_results = []
             print(f"\n--- Running Simulation for Strategy: NORMAL ---")
-            results_normal = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "NORMAL", verbose=False)
+            results_normal = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "NORMAL", vix_data, sp500_data, verbose=False)
             performance_normal = calculate_summary_performance(results_normal["portfolio_df"], results_normal["completed_trades"])
             if performance_normal:
                 performance_normal["Strategy"] = "NORMAL"
                 all_results.append(performance_normal)
 
             print(f"\n--- Running Simulation for Strategy: INVERSE ---")
-            results_inverse = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "INVERSE", verbose=False)
+            results_inverse = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "INVERSE", vix_data, sp500_data, verbose=False)
             performance_inverse = calculate_summary_performance(results_inverse["portfolio_df"], results_inverse["completed_trades"])
             if performance_inverse:
                 performance_inverse["Strategy"] = "INVERSE"
@@ -348,7 +465,7 @@ if __name__ == '__main__':
                 print("No results to display.")
         else:
             print(f"\n--- Running Simulation for Prioritization Method: {PRIORITIZATION_METHOD} ---")
-            results = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, STRATEGY_TYPE, verbose=True)
+            results = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, STRATEGY_TYPE, vix_data, sp500_data, verbose=True)
             print_single_run_details(results)
 
     elapsed_seconds = time.perf_counter() - start_time
