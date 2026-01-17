@@ -12,6 +12,11 @@ import pandas_ta as ta
 from datetime import datetime
 import math
 import time
+import os
+import re
+import requests
+from io import StringIO
+from bs4 import BeautifulSoup
 
 # ==============================================================================
 # --- CONFIGURATION ---
@@ -19,11 +24,11 @@ import time
 LEVERAGE_FACTOR = 5
 INITIAL_CAPITAL = 350.0
 MAX_CONCURRENT_POSITIONS = 8
-START_DATE = "2007-10-01" # YYYY-MM-DD
-END_DATE = "2009-03-31"
+START_DATE = "2020-01-01" # YYYY-MM-DD
+END_DATE = "2025-12-31"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
 # ==============================================================================
-PRIORITIZATION_METHOD = ['RSI', 'RSI_DESC'] # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
+PRIORITIZATION_METHOD = 'RSI' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
 ALL_METHODS = ['RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC']
 STRATEGY_TYPE = "NORMAL" # Options: "NORMAL", "INVERSE", "BOTH"
 # ==============================================================================
@@ -57,6 +62,47 @@ def prepare_data(tickers):
         vix_data = None
     else:
         vix_data = vix_data[['Close']].rename(columns={'Close': 'vix_close'})
+
+    # Download Fed Funds Rate data for swap calculation
+    # Download Fed Funds Rate data by scraping
+    try:
+        url = "https://datosmacro.expansion.com/tipo-interes/usa"
+        response = requests.get(url)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        table = soup.find('table', {'class': 'table-striped'})
+
+        dates = []
+        rates = []
+        for row in table.find_all('tr')[1:]: # Skip header row
+            cols = row.find_all('td')
+            # The date is in the first column, rate in the second
+            date_str = cols[0].text.strip()
+            rate_str = cols[1].text.strip().replace('%', '').replace(',', '.')
+            
+            # Convert date from DD/MM/YYYY to YYYY-MM-DD
+            day, month, year = date_str.split('/')
+            formatted_date = f"{year}-{month}-{day}"
+            
+            dates.append(formatted_date)
+            rates.append(float(rate_str))
+
+        fed_funds_data = pd.DataFrame({'fed_rate': rates}, index=pd.to_datetime(dates))
+        # The scraped data is not daily, so we need to reindex and ffill
+        # We also need to sort the index as the table is descending
+        fed_funds_data = fed_funds_data.sort_index()
+        all_dates = pd.date_range(start=fed_funds_data.index.min(), end=END_DATE, freq='D')
+        fed_funds_data = fed_funds_data.reindex(all_dates, method='ffill')
+
+
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Could not download Fed Funds Rate data. Error: {e}. Swap calculation will be disabled.")
+        fed_funds_data = None
+    except Exception as e:
+        print(f"Warning: Could not process Fed Funds Rate data. Error: {e}. Swap calculation will be disabled.")
+        fed_funds_data = None
+
     # Batch download to be friendlier to the API
     for i in range(0, len(tickers), 100):
         batch = tickers[i:i+100]
@@ -81,6 +127,8 @@ def prepare_data(tickers):
         vix_data = vix_data.reindex(master_index, method='ffill')
     if sp500_data is not None:
         sp500_data = sp500_data.reindex(master_index, method='ffill')
+    if fed_funds_data is not None:
+        fed_funds_data = fed_funds_data.reindex(master_index, method='ffill')
     for ticker in all_historical_data: all_historical_data[ticker] = all_historical_data[ticker].reindex(master_index, method='ffill')
 
     print("Step 3: Pre-calculating signals...")
@@ -122,10 +170,10 @@ def prepare_data(tickers):
         del all_historical_data[ticker]
     
     if vix_data is not None:
-        return all_historical_data, master_index, vix_data, sp500_data
-    return all_historical_data, master_index, None, None
+        return all_historical_data, master_index, vix_data, sp500_data, fed_funds_data
+    return all_historical_data, master_index, None, None, None
 
-def run_simulation(all_historical_data, master_index, prioritization_method, strategy_type, vix_data, sp500_data, verbose=True):
+def run_simulation(all_historical_data, master_index, prioritization_method, strategy_type, vix_data, sp500_data, fed_funds_data, verbose=True):
     cash = INITIAL_CAPITAL
     portfolio_value_history, positions, completed_trades = [], {}, []
     system_shut_off = False
@@ -133,6 +181,17 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
     
     for date in master_index:
         if date < pd.to_datetime(START_DATE): continue
+
+        # --- SWAP CALCULATION for leveraged positions ---
+        if LEVERAGE_FACTOR > 1 and fed_funds_data is not None:
+            if date in fed_funds_data.index:
+                current_fed_rate = fed_funds_data.loc[date, 'fed_rate']
+                if pd.notna(current_fed_rate):
+                    # Broker's spread is 2.5%
+                    swap_rate_annual = (current_fed_rate / 100) + 0.025
+                    for ticker, pos_data in positions.items():
+                        daily_swap = (pos_data["notional_value"] * swap_rate_annual) / 360
+                        pos_data["accumulated_swap"] += daily_swap
 
         # Calculate portfolio value at the start of the day to check for bankruptcy
         equity_in_positions = 0
@@ -149,10 +208,11 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                 pos_info = positions[ticker]
                 signal_data = all_historical_data[ticker].loc[date]
                 pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
+                pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
-                print(f"{date.date()}: LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f}")
+                print(f"{date.date()}: LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f})")
                 del positions[ticker]
             
             # Record final value after liquidation and halt
@@ -174,12 +234,14 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
             
             if signal_data[exit_signal] or time_stop_triggered:
                 pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
+                pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Use business days
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
                 exit_reason = "TIME_STOP" if time_stop_triggered else "Price > SMA(5)"
                 if verbose:
-                    print(f"{date.date()}: SELL {'{:.2f}'.format(pos_info['quantity'])} of {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} ({exit_reason}) [Days: {duration}]")
+                    percent_pnl = (pnl / pos_info['investment_cost']) * 100 if pos_info['investment_cost'] > 0 else 0
+                    print(f"{date.date()}: SELL {'{:.2f}'.format(pos_info['quantity'])} of {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f}) | %PL: {percent_pnl:.2f}% ({exit_reason}) [Days: {duration}]")
                 del positions[ticker]
 
         # VIX Protection and System State Logic - this affects NEW ENTRIES only
@@ -219,10 +281,11 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                         pos_info = positions[ticker]
                         signal_data = all_historical_data[ticker].loc[date]
                         pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
+                        pnl -= pos_info["accumulated_swap"]
                         cash += pos_info["investment_cost"] + pnl
                         duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
                         completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
-                        print(f"\033[91m{date.date()}: VIX LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f}\033[0m")
+                        print(f"\033[91m{date.date()}: VIX LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f})\033[0m")
                         del positions[ticker]
             elif is_sp500_bearish:
                 system_shut_off = True
@@ -309,7 +372,13 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
 
                 if cash >= actual_investment_cost:
                     cash -= actual_investment_cost
-                    positions[ticker] = {"quantity": quantity, "buy_date": date, "investment_cost": actual_investment_cost, "notional_value": actual_notional_value}
+                    positions[ticker] = {
+                        "quantity": quantity,
+                        "buy_date": date,
+                        "investment_cost": actual_investment_cost,
+                        "notional_value": actual_notional_value,
+                        "accumulated_swap": 0
+                    }
                     if verbose:
                         print(f"{date.date()}: BUY {'{:.2f}'.format(quantity)} of {ticker} at {price:.2f} | Cost: ${actual_investment_cost:,.2f} (Notional: ${actual_notional_value:,.2f}, RSI: {buy['rsi']:.2f}, HV: {buy.get('hv', 0):.2f}, ADX: {buy.get('adx', 0):.2f})")
         
@@ -337,6 +406,17 @@ def calculate_summary_performance(portfolio_df, completed_trades):
     total_trades = len(completed_trades)
     win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
     avg_duration = sum(t['duration'] for t in completed_trades) / total_trades if total_trades > 0 else 0
+    
+    # Calculate average percent return
+    total_percent_return = 0
+    if total_trades > 0:
+        for t in completed_trades:
+            if t['investment_cost'] > 0:
+                total_percent_return += (t['pnl'] / t['investment_cost']) * 100
+        avg_percent_return = total_percent_return / total_trades
+    else:
+        avg_percent_return = 0
+        
     return {
         "Final Value": f"${final_value:,.2f}",
         "Max Value": f"${max_value:,.2f}",
@@ -344,7 +424,8 @@ def calculate_summary_performance(portfolio_df, completed_trades):
         "Annualized Return": f"{annualized_return_percent:.2f}%",
         "Total Trades": total_trades,
         "Avg Duration (d)": f"{avg_duration:.2f}",
-        "Winrate": f"{win_rate:.2f}%"
+        "Winrate": f"{win_rate:.2f}%",
+        "Avg Profit per Trade": f"{avg_percent_return:.2f}%"
     }
 
 def print_single_run_details(results):
@@ -396,7 +477,129 @@ def print_single_run_details(results):
             print(f"- {ticker}: Held for {duration} days (Quantity: {'{:.2f}'.format(pos['quantity'])})")
     else: print("No positions were open at the end of the backtest.")
 
+    print("\n--- Periodic Returns ---")
+    periodic_returns = calculate_periodic_returns(portfolio_df)
+    for year, data in periodic_returns.items():
+        print(f"\n{year}:")
+        print(f"  Initial Capital: ${data['initial_capital']:,.2f}")
+        print(f"  Yearly P&L: ${data['yearly_pnl']:,.2f} ({data['yearly_return']:.2f}%)")
+        for month, month_data in data['months'].items():
+            print(f"    {month}: ${month_data['pnl']:,.2f} ({month_data['return']:.2f}%)")
+
+def calculate_periodic_returns(portfolio_df):
+    """Calculates yearly and monthly returns from the portfolio value history."""
+    if portfolio_df.empty:
+        return {}
+
+    # Resample to get the last value of each month and year
+    monthly_values = portfolio_df['value'].resample('ME').last()
+    yearly_values = portfolio_df['value'].resample('YE').last()
+
+    # Get initial capital for each year
+    yearly_initial_capital = portfolio_df['value'].resample('YE').first()
+
+    periodic_data = {}
+    for year_end_date in yearly_values.index:
+        year = year_end_date.year
+        initial_capital = yearly_initial_capital.get(year_end_date, 0)
+        final_value = yearly_values.get(year_end_date, 0)
+        
+        yearly_pnl = final_value - initial_capital
+        yearly_return_pct = (yearly_pnl / initial_capital) * 100 if initial_capital > 0 else 0
+
+        periodic_data[year] = {
+            'initial_capital': initial_capital,
+            'yearly_pnl': yearly_pnl,
+            'yearly_return': yearly_return_pct,
+            'months': {}
+        }
+
+        # Monthly Returns
+        monthly_df = portfolio_df[portfolio_df.index.year == year]
+        monthly_starts = monthly_df['value'].resample('MS').first()
+        monthly_ends = monthly_df['value'].resample('ME').last()
+        
+        for month_start_date in monthly_starts.index:
+            month_end_date = month_start_date + pd.offsets.MonthEnd(0)
+            start_val = monthly_starts[month_start_date]
+            end_val = monthly_ends.get(month_end_date, start_val)
+            
+            month_pnl = end_val - start_val
+            month_return_pct = (month_pnl / start_val) * 100 if start_val > 0 else 0
+            
+            periodic_data[year]['months'][month_end_date.strftime('%B')] = {
+                'pnl': month_pnl,
+                'return': month_return_pct
+            }
+            
+    return periodic_data
+
+def write_report(results, config, logs):
+    """Writes the backtest report to a markdown file."""
+    # Ensure the target directory exists
+    output_dir = "docs/backtests"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    filename_base = f"{config['START_DATE']}-{config['END_DATE']}"
+    
+    # Check for existing files and increment suffix
+    i = 1
+    filename = os.path.join(output_dir, f"{filename_base}.md")
+    while os.path.exists(filename):
+        filename = os.path.join(output_dir, f"{filename_base}-{i}.md")
+        i += 1
+
+    with open(filename, 'w') as f:
+        f.write("# Backtest Report\n")
+        f.write("## Configuration\n")
+        for key, value in config.items():
+            f.write(f"- **{key}:** {value}\n")
+        
+        f.write("\n## Performance Summary\n")
+        summary = calculate_summary_performance(results["portfolio_df"], results["completed_trades"])
+        if summary:
+            for key, value in summary.items():
+                f.write(f"- **{key}:** {value}\n")
+
+        f.write("\n## Periodic Returns\n")
+        periodic_returns = calculate_periodic_returns(results["portfolio_df"])
+        for year, data in periodic_returns.items():
+            f.write(f"### {year}\n")
+            f.write(f"- **Initial Capital:** ${data['initial_capital']:,.2f}\n")
+            f.write(f"- **Yearly P&L:** ${data['yearly_pnl']:,.2f} ({data['yearly_return']:.2f}%)\n")
+            for month, month_data in data['months'].items():
+                f.write(f"  - **{month}:** ${month_data['pnl']:,.2f} ({month_data['return']:.2f}%)\n")
+        
+        f.write("\n## Trade Log\n")
+        # Function to remove ANSI escape codes
+        def remove_ansi_codes(text):
+            ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+            return ansi_escape.sub('', text)
+
+        for log_entry in logs:
+            f.write(f"{remove_ansi_codes(log_entry)}\n")
+
 if __name__ == '__main__':
+    # Capture logs
+    import sys
+    from io import StringIO
+    
+    original_stdout = sys.stdout
+    log_stream = StringIO()
+
+    class Tee(object):
+        def __init__(self, *files):
+            self.files = files
+        def write(self, obj):
+            for f in self.files:
+                f.write(obj)
+        def flush(self):
+            for f in self.files:
+                f.flush()
+
+    sys.stdout = Tee(sys.stdout, log_stream)
+
+
     start_time = time.perf_counter()
     all_tickers = []
     for fp in TICKER_FILES:
@@ -406,7 +609,7 @@ if __name__ == '__main__':
     unique_tickers = sorted(list(set(all_tickers)))
     print(f"Loaded {len(unique_tickers)} unique tickers.")
     
-    all_historical_data, master_index, vix_data, sp500_data = prepare_data(unique_tickers)
+    all_historical_data, master_index, vix_data, sp500_data, fed_funds_data = prepare_data(unique_tickers)
     
     if isinstance(PRIORITIZATION_METHOD, list) or PRIORITIZATION_METHOD == 'ALL':
         methods_to_run = PRIORITIZATION_METHOD if isinstance(PRIORITIZATION_METHOD, list) else ALL_METHODS
@@ -421,7 +624,7 @@ if __name__ == '__main__':
             all_results = []
             for method in methods_to_run:
                 print(f"--- Prioritization Method: {method} ---")
-                results = run_simulation(all_historical_data, master_index, method, strategy, vix_data, sp500_data, verbose=False)
+                results = run_simulation(all_historical_data, master_index, method, strategy, vix_data, sp500_data, fed_funds_data, verbose=False)
                 performance = calculate_summary_performance(results["portfolio_df"], results["completed_trades"])
                 if performance:
                     performance["Method"] = method
@@ -441,14 +644,14 @@ if __name__ == '__main__':
         if STRATEGY_TYPE == "BOTH":
             all_results = []
             print(f"\n--- Running Simulation for Strategy: NORMAL ---")
-            results_normal = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "NORMAL", vix_data, sp500_data, verbose=False)
+            results_normal = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "NORMAL", vix_data, sp500_data, fed_funds_data, verbose=False)
             performance_normal = calculate_summary_performance(results_normal["portfolio_df"], results_normal["completed_trades"])
             if performance_normal:
                 performance_normal["Strategy"] = "NORMAL"
                 all_results.append(performance_normal)
 
             print(f"\n--- Running Simulation for Strategy: INVERSE ---")
-            results_inverse = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "INVERSE", vix_data, sp500_data, verbose=False)
+            results_inverse = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, "INVERSE", vix_data, sp500_data, fed_funds_data, verbose=False)
             performance_inverse = calculate_summary_performance(results_inverse["portfolio_df"], results_inverse["completed_trades"])
             if performance_inverse:
                 performance_inverse["Strategy"] = "INVERSE"
@@ -465,8 +668,28 @@ if __name__ == '__main__':
                 print("No results to display.")
         else:
             print(f"\n--- Running Simulation for Prioritization Method: {PRIORITIZATION_METHOD} ---")
-            results = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, STRATEGY_TYPE, vix_data, sp500_data, verbose=True)
+            results = run_simulation(all_historical_data, master_index, PRIORITIZATION_METHOD, STRATEGY_TYPE, vix_data, sp500_data, fed_funds_data, verbose=True)
             print_single_run_details(results)
+
+            # After the run, write the report
+            sys.stdout = original_stdout # Restore stdout
+            logs = log_stream.getvalue().splitlines()
+            
+            config = {
+                "LEVERAGE_FACTOR": LEVERAGE_FACTOR,
+                "INITIAL_CAPITAL": INITIAL_CAPITAL,
+                "MAX_CONCURRENT_POSITIONS": MAX_CONCURRENT_POSITIONS,
+                "START_DATE": START_DATE,
+                "END_DATE": END_DATE,
+                "TICKER_FILES": TICKER_FILES,
+                "PRIORITIZATION_METHOD": PRIORITIZATION_METHOD,
+                "STRATEGY_TYPE": STRATEGY_TYPE,
+                "VIX_PROTECTION": VIX_PROTECTION,
+                "PANIC_BUTTON": PANIC_BUTTON,
+                "TIME_STOP": TIME_STOP,
+                "SP500_ENTRY_THRESHOLD": SP500_ENTRY_THRESHOLD
+            }
+            write_report(results, config, logs)
 
     elapsed_seconds = time.perf_counter() - start_time
     minutes, seconds = divmod(elapsed_seconds, 60)

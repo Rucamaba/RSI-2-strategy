@@ -1,6 +1,5 @@
 """
-This script analyzes tickers to identify buying opportunities
-based on the RSI(2) mean-reversion strategy.
+This script analyzes tickers to identify buying opportunities based on the RSI(2) mean-reversion strategy.
 1. Trend Filter: Price > 200-day SMA && S&P 500 > (200-day SMA * SP500_ENTRY_THRESHOLD) && VIX < VIX_PROTECTION
 2. Setup: RSI(2) < 5 (Normal) or RSI(2) > 95 (Inverse)
 3. Sell: Price > 5-day SMA (Normal) or Price < 5-day SMA (Inverse)
