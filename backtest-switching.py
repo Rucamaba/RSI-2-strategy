@@ -1,8 +1,15 @@
 """
-This script do a backtest of the trading strategy based on the RSI(2) mean-reversion strategy.
+This script do a backtest of the trading strategy based on the RSI(2) mean-reversion strategy with dynamic strategy switching.
+
+NORMAL Strategy (active when market is healthy):
 1. Trend Filter: Price > 200-day SMA && S&P 500 > (200-day SMA * SP500_ENTRY_THRESHOLD) && VIX < VIX_PROTECTION
 2. Setup: RSI(2) < 5
 3. Sell: Price > 5-day SMA OR TIME_STOP
+
+INVERSE Strategy (activated when VIX > VIX_PROTECTION OR S&P 500 < 200-day SMA):
+1. Trend Filter: Price < 200-day SMA && S&P 500 < (200-day SMA * SP500_ENTRY_THRESHOLD)
+2. Setup: Buy short when Price < 200-day SMA AND RSI(2) > 85
+3. Sell short: RSI(2) < 30 OR TIME_STOP OR Price < 5-day SMA
 """
 
 import pandas as pd
@@ -22,10 +29,10 @@ from bs4 import BeautifulSoup
 # --- CONFIGURATION ---
 # ==============================================================================
 LEVERAGE_FACTOR = 5
-INITIAL_CAPITAL = 350.0
+INITIAL_CAPITAL = 1700.0
 MAX_CONCURRENT_POSITIONS = 8
-START_DATE = "2020-01-01" # YYYY-MM-DD
-END_DATE = "2025-12-31"
+START_DATE = "2007-01-01" # YYYY-MM-DD
+END_DATE = "2009-12-31"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
 # ==============================================================================
 PRIORITIZATION_METHOD = 'RSI' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
@@ -54,6 +61,7 @@ def prepare_data(tickers):
             sp500_data.columns = sp500_data.columns.droplevel(1)
         sp500_data.columns = [str(col).lower() for col in sp500_data.columns]
         sp500_data['sma_200'] = ta.sma(sp500_data['close'], length=200)
+        sp500_data['is_bearish'] = sp500_data['close'] < (sp500_data['sma_200'] * SP500_ENTRY_THRESHOLD)
 
     # Download VIX data
     vix_data = yf.download('^VIX', start=data_start_date, end=END_DATE, progress=False)
@@ -159,9 +167,11 @@ def prepare_data(tickers):
             df["is_buy_signal_normal"] = (df["close"] > df["sma_200"]) & (df["rsi_2"] < 5) & (df["close"] < df["sma_5"])
             df["is_exit_signal_normal"] = df["close"] > df["sma_5"]
             
-            # Inverse Strategy Signals
-            df["is_buy_signal_inverse"] = (df["close"] < df["sma_200"]) & (df["rsi_2"] > 95) & (df["close"] > df["sma_5"])
-            df["is_exit_signal_inverse"] = df["close"] < df["sma_5"]
+            # Inverse Strategy Signals (for shorting)
+            # BUY short when: Price < 200-day SMA AND RSI(2) > 85 AND S&P 500 bearish
+            df["is_buy_signal_inverse"] = (df["close"] < df["sma_200"]) & (df["rsi_2"] > 85)
+            # SELL short when: RSI(2) < 30 OR Price < 5-day SMA
+            df["is_exit_signal_inverse"] = (df["rsi_2"] < 30) | (df["close"] < df["sma_5"])
         except Exception as e:
             print(f"Warning: Could not calculate indicators for {ticker}. It will be removed. Error: {e}")
             tickers_to_remove.append(ticker)
@@ -173,221 +183,284 @@ def prepare_data(tickers):
         return all_historical_data, master_index, vix_data, sp500_data, fed_funds_data
     return all_historical_data, master_index, None, None, None
 
-def run_simulation(all_historical_data, master_index, prioritization_method, strategy_type, vix_data, sp500_data, fed_funds_data, verbose=True):
+def run_simulation(all_historical_data, master_index, prioritization_method, initial_strategy_type, vix_data, sp500_data, fed_funds_data, verbose=True):
     cash = INITIAL_CAPITAL
     portfolio_value_history, positions, completed_trades = [], {}, []
-    system_shut_off = False
-    previous_system_state = False  # Track previous state to detect changes
+    strategy_type = initial_strategy_type 
+    previous_strategy = initial_strategy_type
+    strategy_type_history = [] 
     
-    for date in master_index:
-        if date < pd.to_datetime(START_DATE): continue
+    # Cacheo para optimización
+    dates_list = [d for d in master_index if d >= pd.to_datetime(START_DATE)]
+    
+    for date in dates_list:
+        
+        # --- 1. CÁLCULO DE SWAP ---
+        if LEVERAGE_FACTOR > 1:
+            # Fallback seguro: si no hay datos de fed, usar un fijo (ej. 4% base + spread)
+            current_fed_rate = 4.0 
+            if fed_funds_data is not None and date in fed_funds_data.index:
+                rate_val = fed_funds_data.loc[date, 'fed_rate']
+                if pd.notna(rate_val):
+                    current_fed_rate = rate_val
+            
+            # Coste de financiación: Fed Rate + 2.5% Spread
+            swap_rate_annual = (current_fed_rate / 100) + 0.025
+            
+            for ticker, pos_data in positions.items():
+                daily_swap = (pos_data["notional_value"] * swap_rate_annual) / 360
+                pos_data["accumulated_swap"] += daily_swap
 
-        # --- SWAP CALCULATION for leveraged positions ---
-        if LEVERAGE_FACTOR > 1 and fed_funds_data is not None:
-            if date in fed_funds_data.index:
-                current_fed_rate = fed_funds_data.loc[date, 'fed_rate']
-                if pd.notna(current_fed_rate):
-                    # Broker's spread is 2.5%
-                    swap_rate_annual = (current_fed_rate / 100) + 0.025
-                    for ticker, pos_data in positions.items():
-                        daily_swap = (pos_data["notional_value"] * swap_rate_annual) / 360
-                        pos_data["accumulated_swap"] += daily_swap
-
-        # Calculate portfolio value at the start of the day to check for bankruptcy
+        # --- 2. CÁLCULO DE EQUITY ---
         equity_in_positions = 0
         for ticker, pos_data in positions.items():
+            # Obtener precio actual (Close del día)
             current_price = all_historical_data[ticker].loc[date]['close']
-            unrealized_pnl = (current_price * pos_data["quantity"]) - pos_data["notional_value"]
+            
+            if pos_data["position_type"] == "SHORT":
+                # En corto: Gano si precio entrada > precio actual
+                unrealized_pnl = pos_data["notional_value"] - (current_price * pos_data["quantity"])
+            else:
+                # En largo: Gano si precio actual > precio entrada
+                unrealized_pnl = (current_price * pos_data["quantity"]) - pos_data["notional_value"]
+            
             equity_in_positions += pos_data["investment_cost"] + unrealized_pnl
+            
         total_portfolio_value = cash + equity_in_positions
 
-        # Halt simulation if bankrupt
+        # --- 3. MARGIN CALL / QUIEBRA ---
         if total_portfolio_value <= 0:
-            print(f"\\n{date.date()}: --- MARGIN CALL! --- Portfolio value is zero or negative. Liquidating all open positions.")
+            print(f"\n{date.date()}: --- MARGIN CALL! --- Portfolio value: ${total_portfolio_value:.2f}. Liquidating all.")
             for ticker in list(positions.keys()):
                 pos_info = positions[ticker]
                 signal_data = all_historical_data[ticker].loc[date]
-                pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
+                
+                # Usar la estrategia de LA POSICIÓN, no la global actual
+                is_short = pos_info["position_type"] == "SHORT"
+                
+                if is_short:
+                    pnl = pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])
+                else:
+                    pnl = (signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"]
+                
                 pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
-                duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
-                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
-                print(f"{date.date()}: LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f})")
+                
+                duration = np.busday_count(pos_info["buy_date"].date(), date.date())
+                completed_trades.append({
+                    "ticker": ticker, "duration": duration, "pnl": pnl, 
+                    "investment_cost": pos_info["investment_cost"],
+                    "exit_reason": "MARGIN_CALL"
+                })
                 del positions[ticker]
             
-            # Record final value after liquidation and halt
-            portfolio_value_history.append({"date": date, "value": cash}) # Final value is remaining cash
-            break
+            portfolio_value_history.append({"date": date, "value": cash}) 
+            break # Fin de la simulación
 
-        # Close positions (including TIME_STOP check) - this ALWAYS runs regardless of system_shut_off
+        # --- 4. CIERRE DE POSICIONES (Signals & Time Stop) ---
         for ticker in list(positions.keys()):
             signal_data = all_historical_data[ticker].loc[date]
-            exit_signal = f"is_exit_signal_{strategy_type.lower()}"
             pos_info = positions[ticker]
             
-            # Check for TIME_STOP condition (business days only, excluding weekends)
+            # Determinar qué señal de salida buscar según cómo se abrió la posición
+            pos_strat = pos_info.get("strategy", "NORMAL")
+            exit_signal_col = f"is_exit_signal_{pos_strat.lower()}"
+            
+            # Time Stop
             time_stop_triggered = False
             if TIME_STOP > 0:
                 days_held = np.busday_count(pos_info["buy_date"].date(), date.date())
                 if days_held >= TIME_STOP:
                     time_stop_triggered = True
             
-            if signal_data[exit_signal] or time_stop_triggered:
-                pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
+            # Chequear señal técnica o time stop
+            if signal_data[exit_signal_col] or time_stop_triggered:
+                is_short = pos_info["position_type"] == "SHORT"
+                
+                # Cálculo PnL
+                if is_short:
+                    pnl = pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])
+                else:
+                    pnl = (signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"]
+                
                 pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
-                duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Use business days
-                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
-                exit_reason = "TIME_STOP" if time_stop_triggered else "Price > SMA(5)"
+                
+                duration = np.busday_count(pos_info["buy_date"].date(), date.date())
+                completed_trades.append({
+                    "ticker": ticker, "duration": duration, "pnl": pnl, 
+                    "investment_cost": pos_info["investment_cost"]
+                })
+                
+                exit_reason = "TIME_STOP" if time_stop_triggered else f"Exit Signal ({pos_strat})"
                 if verbose:
                     percent_pnl = (pnl / pos_info['investment_cost']) * 100 if pos_info['investment_cost'] > 0 else 0
-                    print(f"{date.date()}: SELL {'{:.2f}'.format(pos_info['quantity'])} of {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f}) | %PL: {percent_pnl:.2f}% ({exit_reason}) [Days: {duration}]")
+                    qty_str = "{:.2f}".format(pos_info["quantity"])
+                    print(f"{date.date()}: CLOSE {pos_info['position_type']} {qty_str} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f}) | %PL: {percent_pnl:.2f}% ({exit_reason}) [Days: {duration}]")
+                
                 del positions[ticker]
 
-        # VIX Protection and System State Logic - this affects NEW ENTRIES only
-        # Always evaluate system state based on VIX (if enabled) and S&P 500 trend
-        vix_value = None
-        vix_reactivation_threshold = None
-        
-        if VIX_PROTECTION > 0 and vix_data is not None and date in vix_data.index:
-            vix_value = vix_data.loc[date, 'vix_close']
-            if isinstance(vix_value, pd.Series):
-                vix_value = vix_value.iloc[0]
-            vix_reactivation_threshold = VIX_PROTECTION * 0.8
-        
-        # Get S&P 500 data for trend analysis (always needed for system state)
-        sp500_price = sp500_data.loc[date, 'close'] if sp500_data is not None else None
-        sp500_sma200 = sp500_data.loc[date, 'sma_200'] if sp500_data is not None else None
-        if isinstance(sp500_price, pd.Series):
-            sp500_price = sp500_price.iloc[0]
-        if isinstance(sp500_sma200, pd.Series):
-            sp500_sma200 = sp500_sma200.iloc[0]
-        
-        # Shutdown condition: Price < SMA200
-        is_sp500_bearish = pd.notna(sp500_price) and pd.notna(sp500_sma200) and sp500_price < sp500_sma200
-        
-        # Reactivation condition: Price > SMA200 * SP500_ENTRY_THRESHOLD
-        is_sp500_strong = pd.notna(sp500_price) and pd.notna(sp500_sma200) and sp500_price > (sp500_sma200 * SP500_ENTRY_THRESHOLD)
-        
-        # State change logic
-        if not system_shut_off:
-            # Check if system should shut off
-            if vix_value is not None and vix_value > VIX_PROTECTION:
-                system_shut_off = True
-                print(f"\033[93m{date.date()}: System shut off because VIX > {VIX_PROTECTION} (VIX: {vix_value:.2f})\033[0m")
-                if PANIC_BUTTON and positions:
-                    print(f"\033[91m{date.date()}: PANIC BUTTON ACTIVATED. Liquidating all open positions.\033[0m")
-                    for ticker in list(positions.keys()):
-                        pos_info = positions[ticker]
-                        signal_data = all_historical_data[ticker].loc[date]
-                        pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
-                        pnl -= pos_info["accumulated_swap"]
-                        cash += pos_info["investment_cost"] + pnl
-                        duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
-                        completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
-                        print(f"\033[91m{date.date()}: VIX LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f})\033[0m")
-                        del positions[ticker]
-            elif is_sp500_bearish:
-                system_shut_off = True
-                sp500_price_str = f"{sp500_price:.2f}" if pd.notna(sp500_price) else "N/A"
-                sp500_sma200_str = f"{sp500_sma200:.2f}" if pd.notna(sp500_sma200) else "N/A"
-                print(f"\033[93m{date.date()}: System shut off because S&P500 downtrend (Price: {sp500_price_str} < SMA200: {sp500_sma200_str})\033[0m")
-        else: 
-            # System is shut off - check if it should turn back on
-            vix_condition_ok = vix_value is None or vix_value < vix_reactivation_threshold
-            sp500_condition_ok = is_sp500_strong
-            
-            if vix_condition_ok and sp500_condition_ok:
-                system_shut_off = False
-                sp500_price_str = f"{sp500_price:.2f}" if pd.notna(sp500_price) else "N/A"
-                sp500_sma200_str = f"{sp500_sma200:.2f}" if pd.notna(sp500_sma200) else "N/A"
-                sp500_threshold_str = f"{sp500_sma200 * SP500_ENTRY_THRESHOLD:.2f}" if pd.notna(sp500_sma200) else "N/A"
-                if vix_value is not None:
-                    print(f"\033[92m{date.date()}: System shut on | VIX: {vix_value:.2f} < {vix_reactivation_threshold:.2f} | S&P500: {sp500_price_str} > SMA200: {sp500_sma200_str} (threshold: {sp500_threshold_str})\033[0m")
-                else:
-                    print(f"\033[92m{date.date()}: System shut on | S&P500: {sp500_price_str} > SMA200: {sp500_sma200_str} (threshold: {sp500_threshold_str})\033[0m")
-        
-        previous_system_state = system_shut_off
-        
-        # Skip opening new positions if system is shut off
-        if system_shut_off:
-            portfolio_value_history.append({"date": date, "value": total_portfolio_value})
-            continue
+        # --- 5. LÓGICA DE CAMBIO DE ESTRATEGIA (Switching) ---
+        # Obtener valores escalares y seguros (pueden ser NaN)
+        vix_val = vix_data.loc[date, 'vix_close'] if (vix_data is not None and date in vix_data.index) else np.nan
+        sp500_price = sp500_data.loc[date, 'close'] if sp500_data is not None else np.nan
+        sp500_sma = sp500_data.loc[date, 'sma_200'] if sp500_data is not None else np.nan
 
+        # Asegurar que sean escalares y comparables
+        try:
+            vix_val_num = float(vix_val) if pd.notna(vix_val) else np.nan
+        except Exception:
+            vix_val_num = np.nan
+        try:
+            sp500_price_num = float(sp500_price) if pd.notna(sp500_price) else np.nan
+        except Exception:
+            sp500_price_num = np.nan
+        try:
+            sp500_sma_num = float(sp500_sma) if pd.notna(sp500_sma) else np.nan
+        except Exception:
+            sp500_sma_num = np.nan
+
+        has_sp500 = pd.notna(sp500_price_num) and pd.notna(sp500_sma_num)
+        is_sp500_bearish = (sp500_price_num < sp500_sma_num) if has_sp500 else False
+        is_sp500_strong = (sp500_price_num > (sp500_sma_num * SP500_ENTRY_THRESHOLD)) if has_sp500 else False
+
+        temp_prev_strategy = strategy_type
+
+        if strategy_type == "NORMAL":
+            # Switch to INVERSE?
+            vix_trigger = (VIX_PROTECTION > 0) and pd.notna(vix_val_num) and (vix_val_num > VIX_PROTECTION)
+            if vix_trigger or is_sp500_bearish:
+                strategy_type = "INVERSE"
+                if verbose:
+                    vix_disp = vix_val_num if pd.notna(vix_val_num) else float('nan')
+                    print(f"\033[94m{date.date()}: SWITCH -> INVERSE (VIX: {vix_disp:.2f} or Bearish Market)\033[0m")
+        else:
+            # Switch back to NORMAL?
+            vix_ok = ((VIX_PROTECTION == 0) or (pd.notna(vix_val_num) and (vix_val_num < (VIX_PROTECTION * 0.8))))
+            if vix_ok and is_sp500_strong:
+                strategy_type = "NORMAL"
+                if verbose: print(f"\033[92m{date.date()}: SWITCH -> NORMAL (Market Healthy)\033[0m")
+
+        if strategy_type != temp_prev_strategy:
+            strategy_type_history.append({"date": date, "from": temp_prev_strategy, "to": strategy_type})
+
+        # --- 6. APERTURA DE NUEVAS POSICIONES ---
         open_slots = MAX_CONCURRENT_POSITIONS - len(positions)
-        if open_slots > 0:
-            # S&P 500 Market Trend Filter - use the is_sp500_strong variable calculated earlier
-            if not is_sp500_strong:
-                portfolio_value_history.append({"date": date, "value": total_portfolio_value})
-                continue
+        
+        # Filtros globales de entrada según estrategia actual
+        can_enter = False
+        sp500_is_bearish_num = False
+        if sp500_data is not None and date in sp500_data.index:
+            sp500_is_bearish_num = sp500_data.loc[date, 'is_bearish']
+        
+        if strategy_type == "NORMAL":
+            if is_sp500_strong: can_enter = True
+        else: # INVERSE
+            # Solo entramos en cortos si S&P 500 está bearish
+            if sp500_is_bearish_num: can_enter = True
             
+        if open_slots > 0 and can_enter:
             potential_buys = []
-            for ticker in all_historical_data.keys():
-                if ticker not in positions:
-                    signal_data = all_historical_data[ticker].loc[date]
-                    buy_signal = f"is_buy_signal_{strategy_type.lower()}"
-                    if signal_data[buy_signal] and not pd.isna(signal_data["close"]):
-                        potential_buys.append({
-                            "ticker": ticker,
-                            "rsi": signal_data["rsi_2"],
-                            "price": signal_data["close"],
-                            "hv": signal_data["hv_100"],
-                            "adx": signal_data["adx_14"]
-                        })
+            buy_signal_col = f"is_buy_signal_{strategy_type.lower()}"
             
-            # Sort potential buys based on the configured method
-            if prioritization_method == 'RSI':
-                sorted_buys = sorted(potential_buys, key=lambda x: x['rsi'])
-            elif prioritization_method == 'RSI_DESC':
-                sorted_buys = sorted(potential_buys, key=lambda x: x['rsi'], reverse=True)
-            elif prioritization_method == 'A-Z':
-                sorted_buys = sorted(potential_buys, key=lambda x: x['ticker'])
-            elif prioritization_method == 'Z-A':
-                sorted_buys = sorted(potential_buys, key=lambda x: x['ticker'], reverse=True)
-            elif prioritization_method == 'HV_DESC':
-                sorted_buys = sorted(potential_buys, key=lambda x: x['hv'] if not pd.isna(x['hv']) else 0, reverse=True)
-            elif prioritization_method == 'ADX_DESC':
-                sorted_buys = sorted(potential_buys, key=lambda x: x['adx'] if not pd.isna(x['adx']) else 0, reverse=True)
-            else: # Default to RSI ASC if method is unknown
-                sorted_buys = sorted(potential_buys, key=lambda x: x['rsi'])
-
-            for buy in sorted_buys:
-                if len(positions) >= MAX_CONCURRENT_POSITIONS: break
+            # Recopilar candidatos
+            for ticker in all_historical_data.keys():
+                if ticker in positions: continue
                 
-                # Recalculate open slots and cash per slot for each new trade
-                open_slots = MAX_CONCURRENT_POSITIONS - len(positions)
-                if open_slots <= 0: continue
-                cash_per_slot = cash / open_slots
+                row = all_historical_data[ticker].loc[date]
+                # Verificar si hay señal de compra y datos válidos
+                if row[buy_signal_col] and not pd.isna(row["close"]):
+                    potential_buys.append({
+                        "ticker": ticker,
+                        "rsi": row["rsi_2"],
+                        "price": row["close"],
+                        "hv": row["hv_100"],
+                        "adx": row["adx_14"]
+                    })
+            
+            # 1. Definimos la lógica base
+            sort_key = lambda x: x['rsi'] # Por defecto usamos RSI
+            is_reverse = False            # Por defecto Ascendente (Menor a Mayor)
 
-                ticker = buy["ticker"]
-                price = buy["price"]
+            # 2. Ajustamos según el método elegido
+            if prioritization_method == 'RSI':
+                sort_key = lambda x: x['rsi']
+                # CRÍTICO: Si es INVERSE, queremos RSI alto (Reverse=True)
+                # Si es NORMAL, queremos RSI bajo (Reverse=False)
+                is_reverse = (strategy_type == "INVERSE")
+                
+            elif prioritization_method == 'RSI_DESC':
+                sort_key = lambda x: x['rsi']
+                is_reverse = True
+                
+            elif prioritization_method == 'HV_DESC':
+                sort_key = lambda x: x['hv'] if not pd.isna(x['hv']) else 0
+                is_reverse = True
+                
+            elif prioritization_method == 'ADX_DESC':
+                sort_key = lambda x: x['adx'] if not pd.isna(x['adx']) else 0
+                is_reverse = True
+                
+            elif prioritization_method == 'A-Z':
+                sort_key = lambda x: x['ticker']
+                is_reverse = False
+                
+            elif prioritization_method == 'Z-A':
+                sort_key = lambda x: x['ticker']
+                is_reverse = True
+
+            # 3. Aplicamos la ordenación final a la lista
+            sorted_buys = sorted(potential_buys, key=sort_key, reverse=is_reverse)
+
+            # --- FIN DEL CAMBIO ---
+
+            for buy in sorted_buys[:open_slots]:
+                # Recalcular cash por slot disponible
+                current_open_slots = MAX_CONCURRENT_POSITIONS - len(positions)
+                if current_open_slots == 0: break
+                
+                cash_per_slot = cash / current_open_slots
 
                 target_notional = cash_per_slot * LEVERAGE_FACTOR
-                quantity = math.floor(target_notional / price) if LEVERAGE_FACTOR > 1 else target_notional / price
-                if quantity == 0: continue
+                # Asegurar que no dividimos por cero o precio inválido
+                if buy["price"] <= 0: continue
+                
+                qty = math.floor(target_notional / buy["price"])
+                if qty <= 0: continue
 
-                actual_notional_value = quantity * price
-                actual_investment_cost = actual_notional_value / LEVERAGE_FACTOR
-                if actual_investment_cost < 5.0: continue # Minimum trade size
-
-                if cash >= actual_investment_cost:
-                    cash -= actual_investment_cost
-                    positions[ticker] = {
-                        "quantity": quantity,
+                actual_notional = qty * buy["price"]
+                actual_cost = actual_notional / LEVERAGE_FACTOR
+                if actual_cost < 5.0: continue
+                
+                if cash >= actual_cost:
+                    cash -= actual_cost
+                    pos_type = "SHORT" if strategy_type == "INVERSE" else "LONG"
+                    
+                    positions[buy["ticker"]] = {
+                        "quantity": qty,
                         "buy_date": date,
-                        "investment_cost": actual_investment_cost,
-                        "notional_value": actual_notional_value,
-                        "accumulated_swap": 0
+                        "investment_cost": actual_cost,
+                        "notional_value": actual_notional,
+                        "accumulated_swap": 0.0,
+                        "strategy": strategy_type,
+                        "position_type": pos_type
                     }
                     if verbose:
-                        print(f"{date.date()}: BUY {'{:.2f}'.format(quantity)} of {ticker} at {price:.2f} | Cost: ${actual_investment_cost:,.2f} (Notional: ${actual_notional_value:,.2f}, RSI: {buy['rsi']:.2f}, HV: {buy.get('hv', 0):.2f}, ADX: {buy.get('adx', 0):.2f})")
-        
+                        rsi = buy.get('rsi', np.nan)
+                        hv = buy.get('hv', np.nan)
+                        adx = buy.get('adx', np.nan)
+                        qty_str = "{:.2f}".format(qty)
+                        print(f"{date.date()}: OPEN {pos_type} {qty_str} {buy['ticker']} at {buy['price']:.2f} | Cost: ${actual_cost:,.2f} (Notional: ${actual_notional:,.2f}, RSI: {rsi if pd.notna(rsi) else float('nan'):.2f}, HV: {hv if pd.notna(hv) else 0:.2f}, ADX: {adx if pd.notna(adx) else 0:.2f})")
+
+        # Guardar valor del día
         portfolio_value_history.append({"date": date, "value": total_portfolio_value})
 
+    # Reconstrucción del DataFrame final
     portfolio_df = pd.DataFrame(portfolio_value_history).set_index("date")
-    calendar_range = pd.date_range(start=START_DATE, end=END_DATE)
-    portfolio_df = portfolio_df.reindex(calendar_range, method='ffill')
-    return {"portfolio_df": portfolio_df, "completed_trades": completed_trades, "open_positions": positions}
+    idx_range = pd.date_range(start=START_DATE, end=END_DATE)
+    portfolio_df = portfolio_df.reindex(idx_range, method='ffill')
+    
+    return {"portfolio_df": portfolio_df, "completed_trades": completed_trades, "open_positions": positions, "strategy_history": strategy_type_history}
 
 def calculate_summary_performance(portfolio_df, completed_trades):
     if portfolio_df.empty or portfolio_df['value'].isna().all():
@@ -537,7 +610,7 @@ def calculate_periodic_returns(portfolio_df):
 def write_report(results, config, logs):
     """Writes the backtest report to a markdown file."""
     # Ensure the target directory exists
-    output_dir = "docs/backtests"
+    output_dir = "docs/backtests-switching"
     os.makedirs(output_dir, exist_ok=True)
     
     filename_base = f"{config['START_DATE']}-{config['END_DATE']}"
@@ -549,7 +622,7 @@ def write_report(results, config, logs):
         filename = os.path.join(output_dir, f"{filename_base}-{i}.md")
         i += 1
 
-    with open(filename, 'w') as f:
+    with open(filename, 'w', encoding='utf-8') as f:
         f.write("# Backtest Report\n")
         f.write("## Configuration\n")
         for key, value in config.items():
@@ -570,6 +643,13 @@ def write_report(results, config, logs):
             for month, month_data in data['months'].items():
                 f.write(f"  - **{month}:** ${month_data['pnl']:,.2f} ({month_data['return']:.2f}%)\n")
         
+        # Add Strategy Switching History
+        if "strategy_history" in results and results["strategy_history"]:
+            f.write("\n## Strategy Switching History\n")
+            for switch in results["strategy_history"]:
+                # keys are 'from' and 'to' in run_simulation
+                f.write(f"- **{switch['date'].date()}:** {switch['from']} → {switch['to']}\n")
+        
         f.write("\n## Trade Log\n")
         # Function to remove ANSI escape codes
         def remove_ansi_codes(text):
@@ -578,41 +658,6 @@ def write_report(results, config, logs):
 
         for log_entry in logs:
             f.write(f"{remove_ansi_codes(log_entry)}\n")
-
-def save_comparison_report(summary_df, methods_run, strategy, prioritization_method_config):
-    """Saves the comparison summary to a markdown file."""
-    output_dir = "docs/comparatives/backtests-comps"
-    os.makedirs(output_dir, exist_ok=True)
-
-    if prioritization_method_config == 'ALL':
-        filename_base = "ALL"
-    else:
-        filename_base = "-vs-".join(methods_run)
-    
-    filename = os.path.join(output_dir, f"{filename_base}.md")
-    
-    # Check for existing files and increment suffix
-    i = 1
-    while os.path.exists(filename):
-        filename = os.path.join(output_dir, f"{filename_base}-{i}.md")
-        i += 1
-
-    with open(filename, 'w') as f:
-        f.write(f"# Comparative Backtest Report: {filename_base}\n\n")
-        f.write(f"**Strategy:** {strategy}\n")
-        f.write(f"**Date Range:** {START_DATE} to {END_DATE}\n")
-        f.write(f"**Initial Capital:** ${INITIAL_CAPITAL:,.2f}\n")
-        f.write(f"**Leverage:** 1:{LEVERAGE_FACTOR}\n")
-        f.write(f"**Max Concurrent Positions:** {MAX_CONCURRENT_POSITIONS}\n")
-        f.write(f"**VIX Protection:** {VIX_PROTECTION}\n")
-        f.write(f"**Panic Button:** {PANIC_BUTTON}\n")
-        f.write(f"**Time Stop (days):** {TIME_STOP}\n")
-        f.write(f"**S&P500 Entry Threshold:** {SP500_ENTRY_THRESHOLD}\n\n")
-        f.write("---\n\n")
-        f.write(f"## Overall Performance Summary for {strategy} Strategy\n\n")
-        f.write(summary_df.to_markdown())
-    
-    print(f"\nComparison report saved to {filename}")
 
 if __name__ == '__main__':
     # Capture logs
@@ -671,7 +716,6 @@ if __name__ == '__main__':
                 summary_df['Total Return (sort)'] = summary_df['Total Return'].str.replace('%', '').astype(float)
                 summary_df = summary_df.sort_values(by='Total Return (sort)', ascending=False).drop(columns=['Total Return (sort)'])
                 print(summary_df)
-                save_comparison_report(summary_df, methods_to_run, strategy, PRIORITIZATION_METHOD)
                 print("\nNote: Avg Duration omits Saturdays and Sundays because the markets are closed.")
             else:
                 print("No results to display.")
