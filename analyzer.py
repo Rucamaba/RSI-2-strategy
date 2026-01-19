@@ -1,8 +1,9 @@
 """
 This script analyzes tickers to identify buying opportunities based on the RSI(2) mean-reversion strategy.
 1. Trend Filter: Price > 200-day SMA && S&P 500 > (200-day SMA * SP500_ENTRY_THRESHOLD) && VIX < VIX_PROTECTION
-2. Setup: RSI(2) < 5 (Normal) or RSI(2) > 95 (Inverse)
-3. Sell: Price > 5-day SMA (Normal) or Price < 5-day SMA (Inverse)
+2. Setup: RSI(2) < 5 && Price < 5-day SMA && 14-day ADX < 50
+3. Sell: Price > 5-day SMA
+4. System Status: The system will not look for buy signals if the S&P 500 is in a downtrend or if the VIX is too high.
 """
 
 import yfinance as yf
@@ -118,7 +119,10 @@ def analyze_ticker(ticker_symbol, strategy_type):
         is_uptrend = latest["close"] > latest["sma_200"]
         is_oversold = latest["rsi_2"] < 5
         is_exit_zone = latest["close"] > latest["sma_5"]
-        if is_uptrend and is_oversold:
+        adx_strong_trend = latest["adx_14"] >= 50 if not pd.isna(latest["adx_14"]) else False
+
+        is_entry_zone = latest["close"] < latest["sma_5"]
+        if is_uptrend and is_oversold and is_entry_zone and not adx_strong_trend:
             analysis["is_buy_signal"] = True
             analysis["strategy"] = "NORMAL"
         if is_exit_zone:
@@ -130,7 +134,8 @@ def analyze_ticker(ticker_symbol, strategy_type):
         is_downtrend = latest["close"] < latest["sma_200"]
         is_overbought = latest["rsi_2"] > 95
         is_exit_zone_inverse = latest["close"] < latest["sma_5"]
-        if not analysis["is_buy_signal"] and is_downtrend and is_overbought:
+        is_entry_zone_inverse = latest["close"] > latest["sma_5"]
+        if not analysis["is_buy_signal"] and is_downtrend and is_overbought and is_entry_zone_inverse:
              analysis["is_buy_signal"] = True
              analysis["strategy"] = "INVERSE"
         if is_exit_zone_inverse:
@@ -158,17 +163,23 @@ if __name__ == "__main__":
         # System State Logic
         if VIX_PROTECTION > 0 and vix_value > VIX_PROTECTION:
             system_shut_off = True
-            print(f"{Colors.YELLOW}SYSTEM OFF: VIX ({vix_value:.2f}) is above threshold ({VIX_PROTECTION}).{Colors.RESET}")
+            print(f"{Colors.RED}SYSTEM OFF: VIX ({vix_value:.2f}) is above the configured threshold of {VIX_PROTECTION}.{Colors.RESET}")
         elif is_sp500_bearish:
             system_shut_off = True
-            print(f"{Colors.YELLOW}SYSTEM OFF: S&P 500 is in a downtrend (Price: {sp500_price:.2f} < SMA200: {sp500_sma200:.2f}).{Colors.RESET}")
-        elif not is_sp500_strong:
-             system_shut_off = True
-             print(f"{Colors.YELLOW}SYSTEM OFF: S&P 500 is not strong enough (Price: {sp500_price:.2f}, Required: >{sp500_sma200 * SP500_ENTRY_THRESHOLD:.2f}).{Colors.RESET}")
+            print(f"{Colors.RED}SYSTEM OFF: S&P 500 is in a downtrend (Price: {sp500_price:.2f} < SMA200: {sp500_sma200:.2f}).{Colors.RESET}")
+        
+        if system_shut_off:
+            vix_reactivation_threshold = VIX_PROTECTION * 0.8
+            sp500_reactivation_price = sp500_sma200 * SP500_ENTRY_THRESHOLD
+            print(f"{Colors.YELLOW}WARNING: Market conditions are unfavorable.{Colors.RESET}")
+            print(f"It is recommended not to open new positions until conditions improve.")
+            print(f"Recommended conditions to resume trading:")
+            print(f" - VIX should be below {vix_reactivation_threshold:.2f}")
+            print(f" - S&P 500 should be above the threshold of {sp500_reactivation_price:.2f} (SMA200: {sp500_sma200:.2f})")
         else:
-            print(f"{Colors.GREEN}SYSTEM ON: S&P 500 is strong and VIX is normal.{Colors.RESET}")
-            print(f"-> S&P 500 Price: {sp500_price:.2f} | Strength Threshold: {sp500_sma200 * SP500_ENTRY_THRESHOLD:.2f}")
-            if VIX_PROTECTION > 0: print(f"-> VIX: {vix_value:.2f} | Protection Threshold: {VIX_PROTECTION}")
+            print(f"{Colors.GREEN}SYSTEM ON: Market conditions are favorable for opening new positions.{Colors.RESET}")
+            print(f"-> S&P 500 Price: {sp500_price:.2f} (SMA200: {sp500_sma200:.2f})")
+            if VIX_PROTECTION > 0: print(f"-> VIX: {vix_value:.2f} (Threshold: {VIX_PROTECTION})")
     
     held_positions = load_positions()
     new_positions = held_positions.copy()
@@ -201,13 +212,18 @@ if __name__ == "__main__":
         print("\n--- Scanning for new BUY signals ---")
         market_files = [os.path.join("data", f) for f in os.listdir("data") if f.endswith(".csv")]
         all_tickers = []
+        all_blacklisted_tickers = []
         for f in market_files:
-            all_tickers.extend(get_tickers_from_csv(f))
+            tickers, blacklist = get_tickers_from_csv(f)
+            all_tickers.extend(tickers)
+            all_blacklisted_tickers.extend(blacklist)
         
         unique_tickers = sorted(list(set(all_tickers)))
+        blacklisted_tickers = set(all_blacklisted_tickers)
         print(f"--> Analyzing {len(unique_tickers)} unique tickers.")
         
         buy_signals = []
+        blacklist_buy_signals = []
         for ticker in unique_tickers:
             if ticker in held_positions:
                 continue
@@ -215,13 +231,19 @@ if __name__ == "__main__":
             analysis = analyze_ticker(ticker, STRATEGY_TYPE)
 
             if analysis and analysis["is_buy_signal"]:
-                buy_signals.append(analysis)
-                print(f"{Colors.GREEN}BUY SIGNAL (Strategy: {analysis['strategy']}): {ticker} @ ${analysis['price']:.2f} (Approx. Take Profit: ${analysis['sma5']:.2f}){Colors.RESET}")
-                if ticker not in new_positions:
-                    new_positions.append(ticker)
+                if ticker in blacklisted_tickers:
+                    blacklist_buy_signals.append(analysis)
+                    print(f"{Colors.YELLOW}BLACKLISTED BUY SIGNAL: {ticker} @ ${analysis['price']:.2f} (RSI: {analysis['rsi']:.2f}, HV: {analysis.get('hv', 0):.2f}, ADX: {analysis.get('adx', 0):.2f}). This ticker has historically poor performance in this strategy.{Colors.RESET}")
+                else:
+                    buy_signals.append(analysis)
+                    print(f"{Colors.GREEN}BUY SIGNAL (Strategy: {analysis['strategy']}): {ticker} @ ${analysis['price']:.2f} (RSI: {analysis['rsi']:.2f}, HV: {analysis.get('hv', 0):.2f}, ADX: {analysis.get('adx', 0):.2f}){Colors.RESET}")
+                    if ticker not in new_positions:
+                        new_positions.append(ticker)
         
-        if buy_signals:
+        if buy_signals or blacklist_buy_signals:
             print(f"\n--- Strong Buy Signals (Sorted by {PRIORITIZATION_METHOD}) ---")
+            
+            # Sort normal buy signals
             if PRIORITIZATION_METHOD == 'RSI':
                 buy_signals.sort(key=lambda x: x['rsi'])
             elif PRIORITIZATION_METHOD == 'RSI_DESC':
@@ -235,8 +257,17 @@ if __name__ == "__main__":
             elif PRIORITIZATION_METHOD == 'ADX_DESC':
                 buy_signals.sort(key=lambda x: x['adx'] if not pd.isna(x['adx']) else 0, reverse=True)
             
+            # Print sorted normal signals
             for signal in buy_signals:
-                 print(f"{Colors.GREEN}BUY ({signal['strategy']}): {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}, HV: {signal.get('hv', 0):.2f}, ADX: {signal.get('adx', 0):.2f}){Colors.RESET}")
+                print(f"{Colors.GREEN}BUY ({signal['strategy']}): {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}, HV: {signal.get('hv', 0):.2f}, ADX: {signal.get('adx', 0):.2f}){Colors.RESET}")
+
+            # Print blacklisted signals at the end
+            if blacklist_buy_signals:
+                print(f"\n--- Blacklisted Signals (Not Recommended) ---")
+                # Sort blacklisted signals by ticker for consistent ordering
+                blacklist_buy_signals.sort(key=lambda x: x['ticker'])
+                for signal in blacklist_buy_signals:
+                    print(f"{Colors.YELLOW}BLACKLISTED BUY ({signal['strategy']}): {signal['ticker']} @ ${signal['price']:.2f} (RSI: {signal['rsi']:.2f}, HV: {signal.get('hv', 0):.2f}, ADX: {signal.get('adx', 0):.2f}){Colors.RESET}")
 
     save_positions(new_positions)
     print("\nPositions file updated.")

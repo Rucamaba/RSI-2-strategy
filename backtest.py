@@ -1,8 +1,12 @@
 """
 This script do a backtest of the trading strategy based on the RSI(2) mean-reversion strategy.
 1. Trend Filter: Price > 200-day SMA && S&P 500 > (200-day SMA * SP500_ENTRY_THRESHOLD) && VIX < VIX_PROTECTION
-2. Setup: RSI(2) < 5
+2. Setup: RSI(2) < 5 && Price < 5-day SMA && ADX(14) < 50 
 3. Sell: Price > 5-day SMA OR TIME_STOP
+
+Shut off conditions: VIX > VIX_PROTECTION (if PANIC_BUTTON is True, sell all positions) OR S&P 500 < 200-day SMA
+
+Shut on conditions: VIX < VIX_PROTECTION * 0.8 AND S&P 500 > (200-day SMA * SP500_ENTRY_THRESHOLD)
 """
 
 import pandas as pd
@@ -17,6 +21,7 @@ import re
 import requests
 from io import StringIO
 from bs4 import BeautifulSoup
+from markets import get_tickers_from_csv
 
 # ==============================================================================
 # --- CONFIGURATION ---
@@ -24,8 +29,8 @@ from bs4 import BeautifulSoup
 LEVERAGE_FACTOR = 5
 INITIAL_CAPITAL = 350.0
 MAX_CONCURRENT_POSITIONS = 8
-START_DATE = "2020-01-01" # YYYY-MM-DD
-END_DATE = "2025-12-31"
+START_DATE = "2005-01-01" # YYYY-MM-DD
+END_DATE = "2014-12-31"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
 # ==============================================================================
 PRIORITIZATION_METHOD = 'RSI' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
@@ -139,12 +144,17 @@ def prepare_data(tickers):
             for col in ['open', 'high', 'low', 'close']:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
-
+            
             df.columns = [str(col).lower() for col in df.columns]
-            df["sma_200"] = ta.sma(df["close"], length=200)
-            df["sma_5"] = ta.sma(df["close"], length=5)
-            df["rsi_2"] = ta.rsi(df["close"], length=2)
-            df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
+
+            # Replace 0 or negative close prices to avoid log errors
+            df_close = df["close"].copy()
+            df_close[df_close <= 0] = 1e-10
+
+            df["sma_200"] = ta.sma(df_close, length=200)
+            df["sma_5"] = ta.sma(df_close, length=5)
+            df["rsi_2"] = ta.rsi(df_close, length=2)
+            df['log_returns'] = np.log(df_close / df_close.shift(1))
             df['hv_100'] = df['log_returns'].rolling(window=100).std() * np.sqrt(252)
             # Ensure high, low, close are available for ADX
             if all(c in df.columns for c in ['high', 'low', 'close']):
@@ -156,11 +166,12 @@ def prepare_data(tickers):
             else:
                 df['adx_14'] = np.nan
             # Normal Strategy Signals
-            df["is_buy_signal_normal"] = (df["close"] > df["sma_200"]) & (df["rsi_2"] < 5) & (df["close"] < df["sma_5"])
+            adx_strong_trend = (df["adx_14"] >= 50)
+            df["is_buy_signal_normal"] = (df["close"] > df["sma_200"]) & (df["rsi_2"] < 5) & (df["close"] < df["sma_5"]) & ~adx_strong_trend
             df["is_exit_signal_normal"] = df["close"] > df["sma_5"]
             
             # Inverse Strategy Signals
-            df["is_buy_signal_inverse"] = (df["close"] < df["sma_200"]) & (df["rsi_2"] > 95) & (df["close"] > df["sma_5"])
+            df["is_buy_signal_inverse"] = (df["close"] < df["sma_200"]) & (df["rsi_2"] > 95) & (df["close"] > df["sma_5"]) & ~adx_strong_trend
             df["is_exit_signal_inverse"] = df["close"] < df["sma_5"]
         except Exception as e:
             print(f"Warning: Could not calculate indicators for {ticker}. It will be removed. Error: {e}")
@@ -211,7 +222,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                 pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
-                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
+                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx")})
                 print(f"{date.date()}: LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f})")
                 del positions[ticker]
             
@@ -237,7 +248,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                 pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Use business days
-                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
+                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx")})
                 exit_reason = "TIME_STOP" if time_stop_triggered else "Price > SMA(5)"
                 if verbose:
                     percent_pnl = (pnl / pos_info['investment_cost']) * 100 if pos_info['investment_cost'] > 0 else 0
@@ -284,7 +295,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                         pnl -= pos_info["accumulated_swap"]
                         cash += pos_info["investment_cost"] + pnl
                         duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
-                        completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"]})
+                        completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx")})
                         print(f"\033[91m{date.date()}: VIX LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f})\033[0m")
                         del positions[ticker]
             elif is_sp500_bearish:
@@ -377,7 +388,10 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                         "buy_date": date,
                         "investment_cost": actual_investment_cost,
                         "notional_value": actual_notional_value,
-                        "accumulated_swap": 0
+                        "accumulated_swap": 0,
+                        "rsi": buy['rsi'],
+                        "hv": buy.get('hv', 0),
+                        "adx": buy.get('adx', 0)
                     }
                     if verbose:
                         print(f"{date.date()}: BUY {'{:.2f}'.format(quantity)} of {ticker} at {price:.2f} | Cost: ${actual_investment_cost:,.2f} (Notional: ${actual_notional_value:,.2f}, RSI: {buy['rsi']:.2f}, HV: {buy.get('hv', 0):.2f}, ADX: {buy.get('adx', 0):.2f})")
@@ -486,6 +500,10 @@ def print_single_run_details(results):
         for month, month_data in data['months'].items():
             print(f"    {month}: ${month_data['pnl']:,.2f} ({month_data['return']:.2f}%)")
 
+    # Detailed statistics
+    detailed_stats_str = generate_detailed_statistics(completed_trades)
+    print(detailed_stats_str)
+
 def calculate_periodic_returns(portfolio_df):
     """Calculates yearly and monthly returns from the portfolio value history."""
     if portfolio_df.empty:
@@ -534,6 +552,85 @@ def calculate_periodic_returns(portfolio_df):
             
     return periodic_data
 
+def generate_detailed_statistics(completed_trades):
+    """Generates a string with detailed statistics about completed trades."""
+    if not completed_trades:
+        return ""
+
+    output = "\n--- Detailed Statistics ---\n"
+
+    # --- Winrate by Ticker ---
+    output += "\n--- Winrate by Ticker ---\n"
+    ticker_stats = {}
+    for trade in completed_trades:
+        ticker = trade['ticker']
+        if ticker not in ticker_stats:
+            ticker_stats[ticker] = {'wins': 0, 'losses': 0, 'total': 0}
+        
+        ticker_stats[ticker]['total'] += 1
+        if trade['pnl'] > 0:
+            ticker_stats[ticker]['wins'] += 1
+        else:
+            ticker_stats[ticker]['losses'] += 1
+    
+    # Calculate winrate for sorting
+    for ticker in ticker_stats:
+        stats = ticker_stats[ticker]
+        stats['win_rate'] = (stats['wins'] / stats['total']) * 100 if stats['total'] > 0 else 0
+
+    # Sort by winrate descending, then by number of trades descending
+    sorted_tickers = sorted(ticker_stats.items(), key=lambda item: (-item[1]['win_rate'], -item[1]['total']))
+
+    for ticker, stats in sorted_tickers:
+        output += f"{ticker}: {stats['win_rate']:.2f}% winrate ({stats['wins']}/{stats['total']} trades)\n"
+
+    # --- Winrate by Indicator Ranges ---
+    def calculate_winrate_by_range(trades, key, bins):
+        range_stats = {f"{b[0]}-{b[1]}": {'wins': 0, 'total': 0} for b in bins}
+        
+        for trade in trades:
+            value = trade.get(key)
+            if value is None or pd.isna(value): continue
+
+            for b_start, b_end in bins:
+                if b_start <= value < b_end:
+                    bin_name = f"{b_start}-{b_end}"
+                    range_stats[bin_name]['total'] += 1
+                    if trade['pnl'] > 0:
+                        range_stats[bin_name]['wins'] += 1
+                    break
+        
+        return range_stats
+
+    # RSI Ranges (0 to 5, in 0.5 steps)
+    rsi_bins = [(i * 0.5, (i + 1) * 0.5) for i in range(0, 10)]
+    rsi_stats = calculate_winrate_by_range(completed_trades, 'rsi', rsi_bins)
+    output += "\n--- Winrate by RSI(2) Range at Entry ---\n"
+    for r, stats in rsi_stats.items():
+        if stats['total'] > 0:
+            win_rate = (stats['wins'] / stats['total']) * 100
+            output += f"RSI {r}: {win_rate:.2f}% winrate ({stats['wins']}/{stats['total']} trades)\n"
+
+    # HV Ranges
+    hv_bins = [(i/100, (i+10)/100) for i in range(0, 200, 10)]
+    hv_stats = calculate_winrate_by_range(completed_trades, 'hv', hv_bins)
+    output += "\n--- Winrate by HV(100) Range at Entry ---\n"
+    for r, stats in hv_stats.items():
+        if stats['total'] > 0:
+            win_rate = (stats['wins'] / stats['total']) * 100
+            output += f"HV {r}: {win_rate:.2f}% winrate ({stats['wins']}/{stats['total']} trades)\n"
+            
+    # ADX Ranges
+    adx_bins = [(i, i + 10) for i in range(0, 100, 10)]
+    adx_stats = calculate_winrate_by_range(completed_trades, 'adx', adx_bins)
+    output += "\n--- Winrate by ADX(14) Range at Entry ---\n"
+    for r, stats in adx_stats.items():
+        if stats['total'] > 0:
+            win_rate = (stats['wins'] / stats['total']) * 100
+            output += f"ADX {r}: {win_rate:.2f}% winrate ({stats['wins']}/{stats['total']} trades)\n"
+            
+    return output
+
 def write_report(results, config, logs):
     """Writes the backtest report to a markdown file."""
     # Ensure the target directory exists
@@ -569,6 +666,20 @@ def write_report(results, config, logs):
             f.write(f"- **Yearly P&L:** ${data['yearly_pnl']:,.2f} ({data['yearly_return']:.2f}%)\n")
             for month, month_data in data['months'].items():
                 f.write(f"  - **{month}:** ${month_data['pnl']:,.2f} ({month_data['return']:.2f}%)\n")
+        
+        # Add Detailed Statistics section
+        f.write("\n## Detailed Statistics\n")
+        detailed_stats = generate_detailed_statistics(results["completed_trades"])
+        if detailed_stats:
+            # Convert the output format to markdown
+            lines = detailed_stats.split('\n')
+            for line in lines:
+                if line.startswith('---'):
+                    # Convert "--- Section ---" to "### Section"
+                    section_name = line.replace('---', '').strip()
+                    f.write(f"### {section_name}\n")
+                elif line.strip():
+                    f.write(f"{line}\n")
         
         f.write("\n## Trade Log\n")
         # Function to remove ANSI escape codes
@@ -637,14 +748,20 @@ if __name__ == '__main__':
 
     start_time = time.perf_counter()
     all_tickers = []
-    for fp in TICKER_FILES:
-        try:
-            with open(fp, 'r') as f: all_tickers.extend([line.strip() for line in f.readlines() if line.strip()])
-        except FileNotFoundError: print(f"Warning: Could not find ticker file: {fp}")
+    all_blacklisted_tickers = []
+    for file_path in TICKER_FILES:
+        tickers, blacklist = get_tickers_from_csv(file_path)
+        all_tickers.extend(tickers)
+        all_blacklisted_tickers.extend(blacklist)
+
     unique_tickers = sorted(list(set(all_tickers)))
-    print(f"Loaded {len(unique_tickers)} unique tickers.")
+    blacklisted_tickers = set(all_blacklisted_tickers)
+
+    # Exclude blacklisted tickers from the simulation
+    tickers_to_run = [t for t in unique_tickers if t not in blacklisted_tickers]
+    print(f"Loaded {len(tickers_to_run)} unique tickers after excluding {len(blacklisted_tickers)} blacklisted tickers.")
     
-    all_historical_data, master_index, vix_data, sp500_data, fed_funds_data = prepare_data(unique_tickers)
+    all_historical_data, master_index, vix_data, sp500_data, fed_funds_data = prepare_data(tickers_to_run)
     
     if isinstance(PRIORITIZATION_METHOD, list) or PRIORITIZATION_METHOD == 'ALL':
         methods_to_run = PRIORITIZATION_METHOD if isinstance(PRIORITIZATION_METHOD, list) else ALL_METHODS

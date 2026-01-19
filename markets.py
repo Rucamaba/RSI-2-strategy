@@ -6,25 +6,43 @@ for various market indices.
 import pandas as pd
 import os
 
-def get_tickers_from_csv(file_path, ticker_column="Ticker"):
+def get_tickers_from_csv(file_path):
     """
-    Reads a list of tickers from a specified column in a CSV file.
+    Reads tickers and a blacklist from a CSV file.
+
+    The CSV file should contain ticker symbols in the first column.
+    The blacklist begins after a line that starts with "Blacklist".
 
     Args:
         file_path (str): The path to the CSV file.
-        ticker_column (str): The name of the column containing the tickers.
 
     Returns:
-        list: A list of tickers, or an empty list if the file cannot be read.
+        tuple: A tuple containing two lists: (tickers, blacklist).
+               Returns ([], []) if the file cannot be read.
     """
     if not os.path.exists(file_path):
         print(f"Warning: Market file not found at '{file_path}'. Skipping.")
-        return []
-    
+        return [], []
+
+    tickers = []
+    blacklist = []
+    is_blacklist_section = False
+
     try:
-        df = pd.read_csv(file_path, header=None)
-        tickers = df[0].dropna().tolist()
-        return tickers
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.lower().startswith('blacklist'):
+                    is_blacklist_section = True
+                    continue
+                
+                if is_blacklist_section:
+                    blacklist.append(line.split(',')[0])
+                else:
+                    tickers.append(line.split(',')[0])
+        return tickers, blacklist
     except Exception as e:
         print(f"Error reading CSV file '{file_path}': {e}")
-        return []
+        return [], []
