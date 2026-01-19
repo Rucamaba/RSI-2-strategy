@@ -25,3 +25,7 @@ You can customize the script to download the tickers for other indices by changi
 ```python
 tickers = si.get_nasdaq_100()
 ```
+
+You can also add a `Blacklist` section to the CSV file to mark tickers that should not be traded. The `analyzer.py` script will still analyze these tickers, but it will advice about historically poor performance.
+
+```
