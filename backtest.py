@@ -27,10 +27,10 @@ from markets import get_tickers_from_csv
 # --- CONFIGURATION ---
 # ==============================================================================
 LEVERAGE_FACTOR = 5
-INITIAL_CAPITAL = 350.0
+INITIAL_CAPITAL = 1400.0
 MAX_CONCURRENT_POSITIONS = 8
-START_DATE = "2005-01-01" # YYYY-MM-DD
-END_DATE = "2014-12-31"
+START_DATE = "2010-01-01" # YYYY-MM-DD
+END_DATE = "2025-12-31"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
 # ==============================================================================
 PRIORITIZATION_METHOD = 'RSI' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
@@ -39,7 +39,7 @@ STRATEGY_TYPE = "NORMAL" # Options: "NORMAL", "INVERSE", "BOTH"
 # ==============================================================================
 VIX_PROTECTION = 45 # VIX threshold to shut off system (0 = disabled). System reactivates when VIX < threshold * 0.8
 PANIC_BUTTON = False # If True, sell all open positions when VIX protection is triggered
-TIME_STOP = 10 # Maximum number of days to hold a position (0 = disabled)
+TIME_STOP = 16 # Maximum number of days to hold a position (0 = disabled)
 SP500_ENTRY_THRESHOLD = 1.02 # S&P 500 must be above SMA(200) * this value to open positions (e.g., 1.01 = 1% above SMA)
 # ==============================================================================
 # ==============================================================================
@@ -209,7 +209,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
         for ticker, pos_data in positions.items():
             current_price = all_historical_data[ticker].loc[date]['close']
             unrealized_pnl = (current_price * pos_data["quantity"]) - pos_data["notional_value"]
-            equity_in_positions += pos_data["investment_cost"] + unrealized_pnl
+            equity_in_positions += pos_data["investment_cost"] + unrealized_pnl - pos_data["accumulated_swap"]
         total_portfolio_value = cash + equity_in_positions
 
         # Halt simulation if bankrupt
