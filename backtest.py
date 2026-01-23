@@ -27,9 +27,9 @@ from markets import get_tickers_from_csv
 # --- CONFIGURATION ---
 # ==============================================================================
 LEVERAGE_FACTOR = 5
-INITIAL_CAPITAL = 1400.0
+INITIAL_CAPITAL = 550.0
 MAX_CONCURRENT_POSITIONS = 8
-START_DATE = "2010-01-01" # YYYY-MM-DD
+START_DATE = "2020-01-01" # YYYY-MM-DD
 END_DATE = "2025-12-31"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
 # ==============================================================================
@@ -222,7 +222,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                 pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
-                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx")})
+                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx"), "sell_date": date})
                 print(f"{date.date()}: LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f})")
                 del positions[ticker]
             
@@ -248,7 +248,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                 pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Use business days
-                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx")})
+                completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx"), "sell_date": date})
                 exit_reason = "TIME_STOP" if time_stop_triggered else "Price > SMA(5)"
                 if verbose:
                     percent_pnl = (pnl / pos_info['investment_cost']) * 100 if pos_info['investment_cost'] > 0 else 0
@@ -295,7 +295,7 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                         pnl -= pos_info["accumulated_swap"]
                         cash += pos_info["investment_cost"] + pnl
                         duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Business days
-                        completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx")})
+                        completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx"), "sell_date": date})
                         print(f"\033[91m{date.date()}: VIX LIQUIDATION of {'{:.2f}'.format(pos_info['quantity'])} {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f})\033[0m")
                         del positions[ticker]
             elif is_sp500_bearish:
@@ -492,11 +492,12 @@ def print_single_run_details(results):
     else: print("No positions were open at the end of the backtest.")
 
     print("\n--- Periodic Returns ---")
-    periodic_returns = calculate_periodic_returns(portfolio_df)
+    periodic_returns = calculate_periodic_returns(portfolio_df, completed_trades)
     for year, data in periodic_returns.items():
         print(f"\n{year}:")
         print(f"  Initial Capital: ${data['initial_capital']:,.2f}")
-        print(f"  Yearly P&L: ${data['yearly_pnl']:,.2f} ({data['yearly_return']:.2f}%)")
+        print(f"  Yearly Realized P&L: ${data['yearly_realized_pnl']:,.2f} ({data['yearly_realized_return']:.2f}%)")
+        print(f"  Yearly Unrealized P&L: ${data['yearly_unrealized_pnl']:,.2f} ({data['yearly_unrealized_return']:.2f}%)")
         for month, month_data in data['months'].items():
             print(f"    {month}: ${month_data['pnl']:,.2f} ({month_data['return']:.2f}%)")
 
@@ -504,8 +505,12 @@ def print_single_run_details(results):
     detailed_stats_str = generate_detailed_statistics(completed_trades)
     print(detailed_stats_str)
 
-def calculate_periodic_returns(portfolio_df):
-    """Calculates yearly and monthly returns from the portfolio value history."""
+def calculate_periodic_returns(portfolio_df, completed_trades):
+    """Calculates yearly and monthly returns from the portfolio value history.
+    
+    For monthly returns: Only shows realized P&L (completed trades that month).
+    For yearly returns: Shows both realized and unrealized P&L.
+    """
     if portfolio_df.empty:
         return {}
 
@@ -522,31 +527,65 @@ def calculate_periodic_returns(portfolio_df):
         initial_capital = yearly_initial_capital.get(year_end_date, 0)
         final_value = yearly_values.get(year_end_date, 0)
         
-        yearly_pnl = final_value - initial_capital
-        yearly_return_pct = (yearly_pnl / initial_capital) * 100 if initial_capital > 0 else 0
+        # Yearly unrealized P&L (from portfolio value)
+        yearly_unrealized_pnl = final_value - initial_capital
+        yearly_unrealized_return_pct = (yearly_unrealized_pnl / initial_capital) * 100 if initial_capital > 0 else 0
+        
+        # Calculate yearly realized P&L (sum of all completed trades that year)
+        yearly_realized_pnl = 0
+        for trade in completed_trades:
+            if 'sell_date' in trade and pd.to_datetime(trade['sell_date']).year == year:
+                yearly_realized_pnl += trade['pnl']
+        yearly_realized_return_pct = (yearly_realized_pnl / initial_capital) * 100 if initial_capital > 0 else 0
 
         periodic_data[year] = {
             'initial_capital': initial_capital,
-            'yearly_pnl': yearly_pnl,
-            'yearly_return': yearly_return_pct,
+            'yearly_unrealized_pnl': yearly_unrealized_pnl,
+            'yearly_unrealized_return': yearly_unrealized_return_pct,
+            'yearly_realized_pnl': yearly_realized_pnl,
+            'yearly_realized_return': yearly_realized_return_pct,
             'months': {}
         }
 
-        # Monthly Returns
-        monthly_df = portfolio_df[portfolio_df.index.year == year]
-        monthly_starts = monthly_df['value'].resample('MS').first()
-        monthly_ends = monthly_df['value'].resample('ME').last()
-        
-        for month_start_date in monthly_starts.index:
-            month_end_date = month_start_date + pd.offsets.MonthEnd(0)
-            start_val = monthly_starts[month_start_date]
-            end_val = monthly_ends.get(month_end_date, start_val)
+        # Monthly Returns (only realized P&L from completed trades)
+        for month_num in range(1, 13):
+            # Find trades closed in this month/year
+            month_realized_pnl = 0
+            for trade in completed_trades:
+                if 'sell_date' in trade:
+                    trade_date = pd.to_datetime(trade['sell_date'])
+                    if trade_date.year == year and trade_date.month == month_num:
+                        month_realized_pnl += trade['pnl']
             
-            month_pnl = end_val - start_val
-            month_return_pct = (month_pnl / start_val) * 100 if start_val > 0 else 0
+            # Get portfolio value at month start for initial capital reference
+            month_start_date = pd.Timestamp(year=year, month=month_num, day=1)
             
-            periodic_data[year]['months'][month_end_date.strftime('%B')] = {
-                'pnl': month_pnl,
+            # For January, always use the initial capital of the year
+            if month_num == 1:
+                month_start_val = initial_capital
+            else:
+                # For other months, try to get the exact portfolio value at month start
+                month_start_portfolio = portfolio_df[portfolio_df.index.date == month_start_date.date()]['value']
+                if not month_start_portfolio.empty:
+                    month_start_val = month_start_portfolio.iloc[0]
+                else:
+                    # If no data at exact month start, use first available date that month
+                    month_portfolio = portfolio_df[(portfolio_df.index.year == year) & (portfolio_df.index.month == month_num)]
+                    if not month_portfolio.empty:
+                        month_start_val = month_portfolio['value'].iloc[0]
+                    else:
+                        # If no data in that month, get the last value from the previous month
+                        prev_month_portfolio = portfolio_df[(portfolio_df.index.year == year) & (portfolio_df.index.month == month_num - 1)]
+                        if not prev_month_portfolio.empty:
+                            month_start_val = prev_month_portfolio['value'].iloc[-1]
+                        else:
+                            month_start_val = initial_capital
+            
+            month_return_pct = (month_realized_pnl / month_start_val) * 100 if month_start_val > 0 else 0
+            
+            month_name = pd.Timestamp(year=year, month=month_num, day=1).strftime('%B')
+            periodic_data[year]['months'][month_name] = {
+                'pnl': month_realized_pnl,
                 'return': month_return_pct
             }
             
@@ -659,11 +698,12 @@ def write_report(results, config, logs):
                 f.write(f"- **{key}:** {value}\n")
 
         f.write("\n## Periodic Returns\n")
-        periodic_returns = calculate_periodic_returns(results["portfolio_df"])
+        periodic_returns = calculate_periodic_returns(results["portfolio_df"], results["completed_trades"])
         for year, data in periodic_returns.items():
             f.write(f"### {year}\n")
             f.write(f"- **Initial Capital:** ${data['initial_capital']:,.2f}\n")
-            f.write(f"- **Yearly P&L:** ${data['yearly_pnl']:,.2f} ({data['yearly_return']:.2f}%)\n")
+            f.write(f"- **Yearly Realized P&L:** ${data['yearly_realized_pnl']:,.2f} ({data['yearly_realized_return']:.2f}%)\n")
+            f.write(f"- **Yearly Unrealized P&L:** ${data['yearly_unrealized_pnl']:,.2f} ({data['yearly_unrealized_return']:.2f}%)\n")
             for month, month_data in data['months'].items():
                 f.write(f"  - **{month}:** ${month_data['pnl']:,.2f} ({month_data['return']:.2f}%)\n")
         
