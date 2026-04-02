@@ -27,10 +27,10 @@ from markets import get_tickers_from_csv
 # --- CONFIGURATION ---
 # ==============================================================================
 LEVERAGE_FACTOR = 5
-INITIAL_CAPITAL = 550.0
+INITIAL_CAPITAL = 450.0
 MAX_CONCURRENT_POSITIONS = 8
 START_DATE = "2020-01-01" # YYYY-MM-DD
-END_DATE = "2025-12-31"
+END_DATE = "2026-04-02"
 TICKER_FILES = ['data/ibex35.csv', 'data/sp500.csv', 'data/nasdaq100.csv']
 # ==============================================================================
 PRIORITIZATION_METHOD = 'RSI' # Options: 'RSI', 'RSI_DESC', 'A-Z', 'Z-A', 'HV_DESC', 'ADX_DESC', or 'ALL' or a list of methods
@@ -39,8 +39,9 @@ STRATEGY_TYPE = "NORMAL" # Options: "NORMAL", "INVERSE", "BOTH"
 # ==============================================================================
 VIX_PROTECTION = 45 # VIX threshold to shut off system (0 = disabled). System reactivates when VIX < threshold * 0.8
 PANIC_BUTTON = False # If True, sell all open positions when VIX protection is triggered
-TIME_STOP = 16 # Maximum number of days to hold a position (0 = disabled)
+TIME_STOP = 15 # Maximum number of days to hold a position (0 = disabled)
 SP500_ENTRY_THRESHOLD = 1.02 # S&P 500 must be above SMA(200) * this value to open positions (e.g., 1.01 = 1% above SMA)
+CLOSE_ON_SMA200_CROSS = False # If True, close open positions when price crosses SMA(200) against the strategy direction
 # ==============================================================================
 # ==============================================================================
 
@@ -68,8 +69,7 @@ def prepare_data(tickers):
     else:
         vix_data = vix_data[['Close']].rename(columns={'Close': 'vix_close'})
 
-    # Download Fed Funds Rate data for swap calculation
-    # Download Fed Funds Rate data by scraping
+    # Download Fed Funds Rate data by scraping for swap calculation
     try:
         url = "https://datosmacro.expansion.com/tipo-interes/usa"
         response = requests.get(url)
@@ -242,14 +242,26 @@ def run_simulation(all_historical_data, master_index, prioritization_method, str
                 days_held = np.busday_count(pos_info["buy_date"].date(), date.date())
                 if days_held >= TIME_STOP:
                     time_stop_triggered = True
+
+            sma200_cross_triggered = False
+            if CLOSE_ON_SMA200_CROSS and pd.notna(signal_data["close"]) and pd.notna(signal_data["sma_200"]):
+                if strategy_type == "INVERSE":
+                    sma200_cross_triggered = signal_data["close"] > signal_data["sma_200"]
+                else:
+                    sma200_cross_triggered = signal_data["close"] < signal_data["sma_200"]
             
-            if signal_data[exit_signal] or time_stop_triggered:
+            if signal_data[exit_signal] or time_stop_triggered or sma200_cross_triggered:
                 pnl = (pos_info["notional_value"] - (signal_data["close"] * pos_info["quantity"])) if strategy_type == "INVERSE" else ((signal_data["close"] * pos_info["quantity"]) - pos_info["notional_value"])
                 pnl -= pos_info["accumulated_swap"]
                 cash += pos_info["investment_cost"] + pnl
                 duration = np.busday_count(pos_info["buy_date"].date(), date.date())  # Use business days
                 completed_trades.append({"ticker": ticker, "duration": duration, "pnl": pnl, "investment_cost": pos_info["investment_cost"], "rsi": pos_info.get("rsi"), "hv": pos_info.get("hv"), "adx": pos_info.get("adx"), "sell_date": date})
-                exit_reason = "TIME_STOP" if time_stop_triggered else "Price > SMA(5)"
+                if time_stop_triggered:
+                    exit_reason = "TIME_STOP"
+                elif sma200_cross_triggered:
+                    exit_reason = "SMA200 Cross"
+                else:
+                    exit_reason = "Price < SMA(5)" if strategy_type == "INVERSE" else "Price > SMA(5)"
                 if verbose:
                     percent_pnl = (pnl / pos_info['investment_cost']) * 100 if pos_info['investment_cost'] > 0 else 0
                     print(f"{date.date()}: SELL {'{:.2f}'.format(pos_info['quantity'])} of {ticker} at {signal_data['close']:.2f} | P&L: ${pnl:,.2f} (Swap: ${pos_info['accumulated_swap']:,.2f}) | %PL: {percent_pnl:.2f}% ({exit_reason}) [Days: {duration}]")
